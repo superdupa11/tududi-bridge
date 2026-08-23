@@ -1,0 +1,18 @@
+# secrets
+.env
+config/config.yml
+config.yml
+
+# runtime data (queue db, etc.)
+data/
+*.db
+*.db-journal
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+.DS_Store

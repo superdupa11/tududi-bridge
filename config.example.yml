@@ -1,0 +1,84 @@
+# tududi-bridge configuration
+# Copy to config/config.yml and edit. Secrets can also come from env vars
+# (NTFY_TOKEN, TUDUDI_API_TOKEN), which take precedence over anything here.
+
+ntfy:
+  base_url: http://10.11.10.209:80
+  # Only needed for self-hosted ntfy with auth, or ntfy Pro reserved topics.
+  # token: tk_xxxxxxxxxxxx
+
+tududi:
+  base_url: http://10.11.10.227:3002
+  token: tt_xxxxxxxxxxxxxxxxxxxx
+  # Override if your tududi version moved things. Check the Swagger UI at
+  # <base_url>/api/v1 and adjust. {id} is substituted at call time.
+  paths:
+    create_task: /api/v1/task
+    update_task: /api/v1/task/{id}
+    list_projects: /api/v1/projects
+
+ollama:
+  base_url: http://10.11.10.229:11434
+  # Sparse MoE is the right shape for CPU inference: 30B of knowledge,
+  # ~3B active per token. Falls back well to qwen3:14b if RAM is tight.
+  model: qwen3:30b-a3b
+  num_ctx: 4096
+  num_thread: 8          # PHYSICAL cores. SMT usually hurts llama.cpp.
+  seed: 42               # fixed seed -> reproducible triage
+  keep_alive: -1         # never unload; an 18GB reload costs minutes
+  request_timeout: 900
+
+worker:
+  poll_interval: 10
+  max_attempts: 3
+  backoff_base: 120      # seconds; doubles each retry
+  stale_after: 1800      # reclaim rows stuck in 'processing'
+  # Skip inference while the box is busy (Plex transcode, parity check, mover).
+  # 0 disables. On an 8-core box, ~6.0 is a reasonable ceiling.
+  load_threshold: 6.0
+  # Optional hard window. Omit to run around the clock.
+  # quiet_hours: { start: 23, end: 7 }
+
+# Topic -> project. The ntfy topic name IS the routing key AND, on ntfy.sh,
+# effectively a password -- append random characters to every one of these.
+# `notes` is injected into the drafting prompt as PROJECT_NOTES.
+topics:
+  episort-1lemx7:
+    project_id: 10   # EpiSort
+    notes: >
+      Renames ripped BluRay TV episode files by matching dialogue (embedded
+      subtitles or local Whisper transcription) against OpenSubtitles
+      references. Python CLI, optional Anthropic API fallback for
+      low-confidence matches.
+  binger-i7opar:
+    project_id: 9    # binger (Movie-Tinder repo)
+    notes: >
+      Self-hosted movie-night group voting app against a Plex library,
+      single Docker container on Unraid. Node 22/TypeScript, Fastify +
+      socket.io server, SQLite via better-sqlite3, React + Vite client.
+  manabase-central-wo48ti:
+    project_id: 8    # Manabase Central
+    notes: >
+      Public hub server aggregating MTG Commander game stats across
+      participating local game stores (LGS); each store's Manabase LGS
+      instance syncs into it. Python FastAPI + Jinja2 ("Elderspell" design
+      system), SQL Server backend, Docker deployment.
+  manabase-lgs-xsa18m:
+    project_id: 2    # Manabase LGS
+    notes: >
+      Commander game stats tracker for a single local game store — players,
+      decks, games — that optionally syncs up to Manabase Central. Python
+      FastAPI + Jinja2 ("Elderspell" design system), SQL Server backend,
+      Docker deployment.
+  manabase-upkeep-9fylqb:
+    project_id: 1    # Manabase Upkeep
+    notes: >
+      Flutter companion mobile app for Manabase LGS — tracks Commander
+      games on the go (life totals, commander damage, game submission)
+      against a store's Manabase LGS server.
+  triage-n5b3t8:
+    project_id: null      # lands in the tududi inbox
+    notes: "Uncategorised capture. Project not yet decided."
+
+# Used when a message arrives on a topic that isn't listed above.
+default_project_id: null
