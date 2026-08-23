@@ -57,7 +57,7 @@ class Tududi:
             body["tags"] = tags
         data = self._call("POST", self.paths["create_task"], json=body)
         task = data.get("task", data) if isinstance(data, dict) else {}
-        task_id = task.get("id") or task.get("uid") or task.get("uuid")
+        task_id = task.get("uid") or task.get("uuid") or task.get("id")
         if task_id is None:
             raise TududiError(f"no task id in create response: {str(data)[:300]}")
         return str(task_id)
