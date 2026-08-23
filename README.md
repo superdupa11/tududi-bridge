@@ -51,7 +51,7 @@ cp config.example.yml /mnt/user/appdata/tududi-bridge/config/config.yml
 ```
 
 **2. API token.** tududi → Settings → API Tokens → create one (`tt_...`). Put it
-in a `.env` next to the compose file as `TUDUDI_API_TOKEN=tt_...`.
+in a `.env` next to `run.sh` as `TUDUDI_API_TOKEN=tt_...`.
 
 **3. Pull the model** on your existing Ollama instance. Locally, if you have
 shell access to that host:
@@ -66,10 +66,15 @@ Or remotely, against its API, from anywhere that can reach it:
 curl http://<ollama-host>:11434/api/pull -d '{"name": "qwen3:30b-a3b"}'
 ```
 
-**4. Discover project IDs.** This also checks every connection:
+**4. Discover project IDs.** This also checks every connection. Build the image
+first if you haven't yet (`docker build -t tududi-bridge:latest .`), then:
 
 ```bash
-docker compose run --rm worker python discover.py
+docker run --rm \
+  -v /mnt/user/appdata/tududi-bridge/config:/config:ro \
+  -v /mnt/user/appdata/tududi-bridge/data:/data \
+  --env-file .env \
+  tududi-bridge:latest python discover.py
 ```
 
 Paste the printed `topics:` block into your config, replace each `CHANGEME`
@@ -78,9 +83,16 @@ with a random suffix, and set the notes.
 **5. Go.**
 
 ```bash
-docker compose up -d
-docker compose logs -f worker
+./run.sh
+docker logs -f tududi-worker
 ```
+
+`run.sh` builds the image and (re)starts the `tududi-ingest` and
+`tududi-worker` containers with plain `docker build`/`docker run` — no
+docker-compose. Host paths default to `/mnt/user/appdata/tududi-bridge`;
+override by exporting `APPDATA_DIR` before running it. Re-run `./run.sh`
+any time you change the Dockerfile or `requirements.txt`; for prompt-only
+edits, `docker restart tududi-worker` is enough since `prompts/` is bind-mounted.
 
 **6. Phone.** Install ntfy from Play Store or F-Droid, subscribe to each topic.
 The message bar at the bottom of a topic view publishes directly. The Android
@@ -131,7 +143,7 @@ slower, not faster.
 ## Tuning the prompts
 
 `prompts/` is bind-mounted read-only into the worker, so edits take effect on
-`docker compose restart worker` — no rebuild. Each file is Markdown with a YAML
+`docker restart tududi-worker` — no rebuild. Each file is Markdown with a YAML
 frontmatter block holding its JSON schema and sampling settings.
 
 The single highest-leverage change you can make is replacing the worked examples
@@ -147,7 +159,7 @@ your change helped.
 
 ```bash
 # queue state
-docker compose run --rm worker python -c \
+docker exec tududi-worker python -c \
   "import config,db;print(db.stats(db.connect(config.DB_PATH)))"
 
 # what the model actually did, most recent first

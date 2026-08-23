@@ -1,6 +1,8 @@
 """Connectivity check + project ID discovery.
 
-    docker compose run --rm worker python discover.py
+    docker run --rm -v /mnt/user/appdata/tududi-bridge/config:/config:ro \
+      -v /mnt/user/appdata/tududi-bridge/data:/data --env-file .env \
+      tududi-bridge:latest python discover.py
 
 Prints a ready-to-paste `topics:` block for config.yml.
 """
