@@ -37,6 +37,7 @@ class Ollama:
             "model": self.model,
             "stream": False,
             "format": schema,
+            "think": False,
             "keep_alive": self.keep_alive,
             "options": options,
             "messages": [
