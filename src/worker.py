@@ -64,17 +64,17 @@ def process(cfg, conn, td, llm, prompts, row):
         log=lambda m: log.info(m),
     )
 
-    title = (final.get("title") or raw.split("\n")[0])[:255]
+    title = pipeline.render_title(final, raw)
     description = pipeline.render_description(final, raw, topic, captured)
     tags = pipeline.derive_tags(final)
 
     task_id = row["tududi_task_id"]
     if task_id:
-        td.update_task(task_id, name=title, description=description, tags=tags)
+        td.update_task(task_id, name=title, note=description, tags=tags)
     else:
         # Stub creation failed at ingest time; create it now.
         task_id = td.create_task(name=title, project_id=project_id,
-                                 description=description, tags=tags)
+                                 note=description, tags=tags)
         db.attach_task(conn, row["id"], task_id)
 
     telemetry["seconds"] = round(time.time() - t0, 1)

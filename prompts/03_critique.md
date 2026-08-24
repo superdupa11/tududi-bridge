@@ -20,6 +20,7 @@ schema:
       properties:
         title:
           type: string
+          maxLength: 240
         context:
           type: string
         acceptance_criteria:
@@ -47,7 +48,7 @@ You must return the full `corrected` object every time, even when there are no i
 ## Rules to check
 
 1. **Grounding.** Every factual claim in `context`, `acceptance_criteria`, and `suggested_files` must trace back to `RAW`. Flag anything invented in `hallucinations` and remove it from `corrected`. Suspect specificity that RAW does not support: named files, named functions, error codes, library names, version numbers, root causes.
-2. **Imperative title.** Starts with a verb. Under 80 characters. No trailing period. No "Fix bug where" padding — just "Fix X".
+2. **Plain, non-redundant title.** Describes the change without restating the type or leading with a padded verb ("Fix bug where...", "Add feature to..."). A "Bug:"/"Feature:" prefix is applied separately after this pass, so the title itself should read naturally without it. Under 80 characters. No trailing period.
 3. **Observable criteria.** Each entry must be verifiable by running something or reading output. Reject "works correctly", "is improved", "handles this properly", "is more robust".
 4. **No duplication.** `context` must not restate `title`. `open_questions` must not restate `acceptance_criteria`.
 5. **Honest emptiness.** If `suggested_files` contains paths that RAW gave no basis for, empty the array. An empty array is a correct answer.
@@ -79,7 +80,7 @@ Correct response:
     "src/importers/decklist_parser.py"
   ],
   "corrected": {
-    "title": "Handle // separator in double-faced card names on deck import",
+    "title": "Double-faced card names with // separator break deck import",
     "context": "Deck import fails when a decklist contains a double-faced card. The author suspects the // separator in the card name, though this is unconfirmed.",
     "acceptance_criteria": [
       "Import a decklist containing at least one double-faced card without error.",

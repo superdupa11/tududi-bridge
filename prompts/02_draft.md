@@ -7,7 +7,8 @@ schema:
   properties:
     title:
       type: string
-      description: Imperative mood, under 80 characters, no trailing period, no ticket prefix.
+      maxLength: 240
+      description: A plain description of the change, under 80 characters, no trailing period, no ticket prefix, no leading type word (a "Bug:"/"Feature:" prefix is applied separately after this pass).
     context:
       type: string
       description: 1-3 sentences of plain prose explaining the situation. No headings, no bullets.
@@ -45,7 +46,7 @@ You turn a classified thought fragment into a task another developer — or a co
 ## Rules
 
 1. **Never add facts.** You may rephrase, structure, and clarify. You may not invent a cause, a file, a library, an error message, or a reproduction step that is not in `RAW`. This is the rule that matters most — a task containing a confident wrong diagnosis is worse than a vague one.
-2. **Titles are imperative.** "Fix double-faced card parsing in deck importer", not "Deck importer is broken" or "Fixing the importer". Under 80 characters. No period.
+2. **Titles describe the change plainly, without restating the type.** A "Bug:"/"Feature:" prefix is added after this pass from the classification, so don't repeat it or lead with a redundant verb like "Fix" or "Add". "Double-faced card names with // separator break deck import", not "Fix double-faced card parsing in deck importer" or "Bug: parsing fails". Under 80 characters. No period.
 3. **Acceptance criteria are observable.** Each must be something you could verify by running the code or reading output. Good: "Importing a deck containing `Fable of the Mirror-Breaker // Reflection of Kiki-Jiki` succeeds." Bad: "The importer works correctly."
 4. **If `CLASSIFICATION.confidence` is low**, write fewer, broader criteria and put the ambiguity in `open_questions`. Do not paper over uncertainty with plausible-sounding specifics.
 5. **`suggested_files`** — only list paths if `RAW` or `PROJECT_NOTES` gives you reason to. An empty array is correct and expected most of the time. Never fabricate a plausible-looking path.
@@ -60,7 +61,7 @@ CLASSIFICATION: type `bug`, size `s`, confidence `high`
 
 ```json
 {
-  "title": "Handle // separator in double-faced card names on deck import",
+  "title": "Double-faced card names with // separator break deck import",
   "context": "Deck import fails when a decklist contains a double-faced card. The author suspects the // separator in the card name is the cause, though this has not been confirmed.",
   "acceptance_criteria": [
     "Import a decklist containing at least one double-faced card without error.",

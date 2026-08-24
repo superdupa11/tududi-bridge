@@ -178,6 +178,12 @@ deciding whether a prompt change was an improvement.
 Tasks land tagged `auto-triaged` plus `type:*`, `size:*`, and either `ready` or
 `needs-refinement`. Point Claude Code at `ready`.
 
+Titles are standardized as `Type: description` (e.g. `Bug: ...`, `Feature: ...`),
+built from the classification pass plus the drafted/critiqued summary. The
+description body is Markdown — a `## Summary` plus whichever of `## Acceptance
+criteria`, `## Open questions`, and `## Likely files` apply — with the verbatim
+capture always preserved at the bottom under `## Original capture`.
+
 ## Verify before you trust it
 
 tududi's endpoint shapes have moved between releases. If `discover.py` reports a

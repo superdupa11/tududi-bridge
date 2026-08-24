@@ -102,13 +102,45 @@ def run(llm, prompts, *, raw_text, project_name, project_notes,
     return final, telemetry
 
 
+TYPE_LABELS = {
+    "bug": "Bug",
+    "feature": "Feature",
+    "chore": "Chore",
+    "idea": "Idea",
+    "question": "Question",
+}
+
+
+MAX_TITLE_LEN = 255  # tududi's task name field cap
+
+
+def render_title(final: dict, raw_text: str) -> str:
+    """Compose the standardized `Type: description` title.
+
+    The draft/critique schemas already cap the drafted summary at 240 chars,
+    leaving room for the longest label ("Question: "), so this should never
+    need to trim in practice. If it ever does, cut at a word boundary rather
+    than mid-word so the visible title still reads cleanly — the untruncated
+    text is never lost, since the full capture is always preserved verbatim
+    in the description.
+    """
+    c = final.get("_classification", {})
+    label = TYPE_LABELS.get(c.get("type"), "Task")
+    summary = (final.get("title") or raw_text.split("\n")[0]).strip()
+    title = f"{label}: {summary}"
+    if len(title) <= MAX_TITLE_LEN:
+        return title
+    clipped = title[:MAX_TITLE_LEN - 1].rsplit(" ", 1)[0]
+    return clipped + "…"
+
+
 def render_description(final: dict, raw_text: str, topic: str, captured_at: str) -> str:
     """Compose the task body. The verbatim capture is ALWAYS preserved last."""
     c = final.get("_classification", {})
     parts = []
 
     if final.get("context"):
-        parts.append(final["context"].strip())
+        parts.append("## Summary\n" + final["context"].strip())
 
     ac = final.get("acceptance_criteria") or []
     if ac:

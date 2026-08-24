@@ -59,7 +59,7 @@ def handle(cfg, conn, td, msg):
         task_id = td.create_task(
             name=title,
             project_id=project_id,
-            description=stub_description(raw, topic, ts),
+            note=stub_description(raw, topic, ts),
             tags=["triage:pending"],
         )
         db.attach_task(conn, row_id, task_id)

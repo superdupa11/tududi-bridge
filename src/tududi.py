@@ -44,13 +44,13 @@ class Tududi:
             return data.get("projects", data.get("data", []))
         return data
 
-    def create_task(self, *, name, project_id=None, description=None,
+    def create_task(self, *, name, project_id=None, note=None,
                     priority=None, tags=None):
         body = {"name": name[:255]}
         if project_id is not None:
             body["project_id"] = project_id
-        if description:
-            body["description"] = description
+        if note:
+            body["note"] = note
         if priority:
             body["priority"] = priority
         if tags:
