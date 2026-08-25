@@ -173,7 +173,11 @@ def process(cfg, conn, td, claude, prompt, row):
     repo_dir, repo_label = gather_repo(cfg, conversation, project_id)
 
     round_n = row["clarification_round"] or 0
-    final_round = round_n >= cfg.max_clarification_rounds
+    # Without a reply topic there is no way to ever resume a parked task, so
+    # treat this the same as having exhausted the round budget -- Claude
+    # always commits to a best-effort plan instead of asking a question that
+    # can never be answered (start_clarification() requires a real topic).
+    final_round = round_n >= cfg.max_clarification_rounds or not cfg.ntfy_reply_topic
 
     history_text = None
     if conversation.get("rounds"):
@@ -281,8 +285,8 @@ def main():
     if cfg.ntfy_reply_topic:
         threading.Thread(target=listen_for_replies, args=(cfg,), daemon=True).start()
     else:
-        log.warning("ntfy.reply_topic not configured -- clarifying questions will be "
-                    "published but replies can never resume a parked task")
+        log.warning("ntfy.reply_topic not configured -- clarifying questions are disabled; "
+                    "every task will get a best-effort plan instead of being asked about")
 
     paused_reason = None
     while True:

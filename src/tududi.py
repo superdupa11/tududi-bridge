@@ -12,6 +12,21 @@ class TududiError(RuntimeError):
     pass
 
 
+def _tag_names(tags):
+    """Read endpoints (list_tasks/get_task) return tags as full objects
+    (e.g. {"id": 5, "name": "plan-me"}), not the plain strings create_task/
+    update_task expect in a request body -- normalize to plain strings so
+    every caller gets one consistent shape regardless of which endpoint it
+    came from."""
+    out = []
+    for t in (tags or []):
+        if isinstance(t, dict):
+            out.append(t.get("name") or t.get("title") or str(t))
+        else:
+            out.append(str(t))
+    return out
+
+
 class Tududi:
     def __init__(self, cfg):
         self.base = cfg.tududi_base
@@ -73,14 +88,18 @@ class Tududi:
             params[self.tag_query_param] = tag
         data = self._call("GET", self.paths["list_tasks"], params=params)
         # Same defensive shape handling as list_projects().
-        if isinstance(data, dict):
-            return data.get("tasks", data.get("data", []))
-        return data
+        tasks = data.get("tasks", data.get("data", [])) if isinstance(data, dict) else data
+        for t in tasks:
+            if isinstance(t, dict):
+                t["tags"] = _tag_names(t.get("tags"))
+        return tasks
 
     def get_task(self, task_id):
         path = self.paths["get_task"].format(id=task_id)
         data = self._call("GET", path)
-        return data.get("task", data) if isinstance(data, dict) else {}
+        task = data.get("task", data) if isinstance(data, dict) else {}
+        task["tags"] = _tag_names(task.get("tags"))
+        return task
 
     def ping(self):
         self.list_projects()
