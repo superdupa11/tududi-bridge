@@ -16,6 +16,7 @@ class Tududi:
     def __init__(self, cfg):
         self.base = cfg.tududi_base
         self.paths = cfg.tududi_paths
+        self.tag_query_param = cfg.tag_query_param
         self.s = requests.Session()
         self.s.headers.update({
             "Authorization": f"Bearer {cfg.tududi_token}",
@@ -65,6 +66,21 @@ class Tududi:
     def update_task(self, task_id, **fields):
         path = self.paths["update_task"].format(id=task_id)
         return self._call("PATCH", path, json=fields)
+
+    def list_tasks(self, *, tag=None):
+        params = {}
+        if tag:
+            params[self.tag_query_param] = tag
+        data = self._call("GET", self.paths["list_tasks"], params=params)
+        # Same defensive shape handling as list_projects().
+        if isinstance(data, dict):
+            return data.get("tasks", data.get("data", []))
+        return data
+
+    def get_task(self, task_id):
+        path = self.paths["get_task"].format(id=task_id)
+        data = self._call("GET", path)
+        return data.get("task", data) if isinstance(data, dict) else {}
 
     def ping(self):
         self.list_projects()

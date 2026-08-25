@@ -2,7 +2,9 @@
 
 Dump a half-formed thought into ntfy from your phone. A local Ollama model turns
 it into a properly written task on the right tududi project a minute or two
-later. Claude Code picks it up from there.
+later. Tag a task `plan-me` and a third daemon hands it to headless Claude
+Code for full scoping, grounded in the actual repo — see
+[AI planning](#ai-planning-tag-triggered) below.
 
 Nothing inbound is exposed. The bridge holds an outbound connection to ntfy and
 talks to tududi and Ollama over the LAN.
@@ -99,6 +101,25 @@ The message bar at the bottom of a topic view publishes directly. The Android
 share sheet also publishes to a topic — that's the fastest capture path for
 links and selected text from any app.
 
+**7. (Optional) AI planning.** A third daemon, `tududi-planner`, hands
+`plan-me`-tagged tasks to headless Claude Code for full scoping — see
+[AI planning](#ai-planning-tag-triggered) below for what it does. To enable it:
+
+```bash
+# One-time, on a machine with an active Claude subscription (Pro/Max/Team):
+claude setup-token
+```
+
+Put the printed token in `.env` as `CLAUDE_CODE_OAUTH_TOKEN=...`. Do **not**
+also put `ANTHROPIC_API_KEY` in `.env` or export it anywhere this container's
+environment is built from — the planner refuses to start if it sees one,
+since Claude Code would otherwise silently prefer it over the subscription
+token and switch billing to pay-per-token. Add `github.repos` and
+`ntfy.reply_topic` to `config.yml` (see `config.example.yml`), then
+`./run.sh` as usual — it now also builds and starts `tududi-planner`.
+Managing containers through Unraid's Docker UI instead of `run.sh`? See
+`unraid-template.xml`.
+
 ## Topic conventions
 
 The topic picks the project. Two more free routing signals come from ntfy's
@@ -155,6 +176,48 @@ Because `seed` is fixed and temperature is low, re-running the same capture
 gives the same output — so you can iterate on a prompt and actually see whether
 your change helped.
 
+## AI planning (tag-triggered)
+
+Tag any tududi task `plan-me` and the `tududi-planner` daemon picks it up: it
+hands the task to headless Claude Code for full scoping — not quick triage,
+a real implementation plan — optionally grounded in the project's actual
+GitHub repo, and writes the result back into the task's note.
+
+```
+tududi (tag: plan-me) ──poll──> planner ──claude -p──> scoped plan ──> tududi.note
+                                    │
+                                    ├─> git clone (if github.repos maps the project)
+                                    └─> ntfy question <──> ntfy reply (if blocked)
+```
+
+**Billed against your Claude subscription, not the Anthropic API.** The
+planner shells out to the `claude` CLI in headless mode (`claude -p`) using
+the long-lived OAuth token from `claude setup-token` (Setup step 7), not an
+API key. It refuses to start if `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` is
+set anywhere in its environment, since Claude Code would otherwise silently
+prefer that over the subscription token.
+
+**Clarifying questions are async.** If Claude genuinely can't produce a full
+plan without more information, it asks — capped at 3 questions, and only
+when truly blocking. The task gets tagged `plan:awaiting-input`, a question
+is published to `ntfy.reply_topic`, and the planner moves on to the next
+queued task rather than blocking on an answer. Reply on that topic and the
+task resumes automatically on the next poll. If more than one task is
+`awaiting-input` at once, prefix your reply with the `PLAN-XXXXXX` token from
+the question; with only one open question, a bare reply resolves it.
+
+**GitHub grounding is a local clone, not a REST API.** Map a tududi project
+to a repo under `github.repos: {project_id: "owner/repo"}` in `config.yml`
+and the planner shallow-clones it fresh before each planning pass, giving
+Claude its own Read/Grep/Glob tools against the real code — no Bash, no
+Edit, no Write, and no prompting (`--permission-mode dontAsk`). Projects
+without a mapping just plan from the task's note and `PROJECT_NOTES` alone.
+
+Tasks land tagged `plan:done` (or `plan:awaiting-input` while parked,
+`plan:plan-failed` after exhausting retries) in place of the trigger tag —
+the planner only ever touches tags it owns; everything else on the task
+(including tags the triage pipeline set) is left alone.
+
 ## Operating it
 
 ```bash
@@ -169,6 +232,18 @@ sqlite3 /mnt/user/appdata/tududi-bridge/data/queue.db \
 # retry everything that failed
 sqlite3 /mnt/user/appdata/tududi-bridge/data/queue.db \
   "UPDATE queue SET status='pending',attempts=0,next_attempt_at=0 WHERE status='failed';"
+
+# planner queue state (separate table, same DB file)
+docker exec tududi-planner python -c \
+  "import config,db;print(db.plan_stats(db.connect(config.DB_PATH)))"
+
+# what's currently awaiting a reply, and the question that was asked
+sqlite3 /mnt/user/appdata/tududi-bridge/data/queue.db \
+  "SELECT id,tududi_task_id,correlation_token,question_text FROM plan_queue WHERE status='awaiting_input';"
+
+# what a completed plan actually cost, most recent first
+sqlite3 /mnt/user/appdata/tududi-bridge/data/queue.db \
+  "SELECT id,tududi_task_id,json_extract(result_json,'$.cost_usd') AS cost_usd FROM plan_queue WHERE status='done' ORDER BY id DESC LIMIT 20;"
 ```
 
 Every completed row stores a `result_json` containing the classification, the

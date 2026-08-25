@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Docker template for the tududi-planner container.
+
+  Build the planner image first (part of ./run.sh, or manually, using the
+  "target planner" build flag with -t tududi-bridge-planner:latest), then
+  add this template via Unraid's Docker tab (Add Container, Template:
+  select this file, or copy it into
+  /boot/config/plugins/dockerMan/templates-user/).
+
+  CLAUDE_CODE_OAUTH_TOKEN is the only Claude credential this template
+  exposes, and it is a plain container Config variable; there is
+  deliberately no Config entry for ANTHROPIC_API_KEY here. Setting that
+  var anywhere in this container's environment (e.g. by hand-adding an
+  extra variable in Unraid's UI) would make Claude Code silently prefer it
+  over the subscription token and switch billing to pay-per-token; the
+  planner refuses to start if it detects one.
+-->
+<Container version="2">
+  <Name>tududi-planner</Name>
+  <Repository>tududi-bridge-planner:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>Tag-triggered AI task planning for tududi. Polls tududi for tasks tagged plan-me, hands each one to headless Claude Code (billed against your Claude subscription, not pay-per-token API usage) for full scoping with optional clarifying questions over ntfy, and writes the resulting plan back to the task's note. Runs alongside the tududi-ingest and tududi-worker containers from the same tududi-bridge image family.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>tududi-worker</Requires>
+
+  <Config Name="Config Dir" Target="/config" Default="/mnt/user/appdata/tududi-bridge/config" Mode="ro" Description="Directory containing config.yml (shared with tududi-ingest/tududi-worker)" Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Data Dir" Target="/data" Default="/mnt/user/appdata/tududi-bridge/data" Mode="rw" Description="Durable queue DB (shared) plus this container's local repo clone cache" Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Prompts Dir" Target="/app/prompts" Default="/mnt/user/appdata/tududi-bridge/prompts" Mode="ro" Description="Prompt templates -- bind-mounted so edits take effect on container restart, no rebuild needed" Type="Path" Display="always" Required="false" Mask="false"/>
+
+  <Config Name="Claude Code OAuth Token" Target="CLAUDE_CODE_OAUTH_TOKEN" Default="" Mode="" Description="Long-lived token from running `claude setup-token` on a machine with an active Claude subscription (Pro/Max/Team). Do NOT set ANTHROPIC_API_KEY anywhere on this container -- see the warning above." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="GitHub Token" Target="GITHUB_TOKEN" Default="" Mode="" Description="Read-only, fine-grained personal access token used to clone private project repos for planning context. Leave blank if every repo mapped under github.repos in config.yml is public." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Timezone" Target="TZ" Default="America/Chicago" Mode="" Description="Container timezone" Type="Variable" Display="always" Required="false" Mask="false"/>
+</Container>
