@@ -101,8 +101,10 @@ planner:
 
 # ---------------------------------------------------------------------------
 # Agentic execution (tag-triggered, picks up plans the planner already
-# finished). Needs container changes beyond config.yml -- see run.sh/
-# Dockerfile's "executor" target and unraid-template-executor.xml:
+# finished). Same shared image as every other daemon here (see Dockerfile),
+# started with `python executor.py` as its trailing command -- but it does
+# need container changes beyond config.yml, see run.sh and
+# unraid-template-executor.xml:
 #   - A workspace volume (host dir -> codeserver.workspace_root here) bind-
 #     mounted into BOTH this container and your code-server container (at
 #     codeserver.workspace_container_root there). Same host path, two
@@ -175,9 +177,10 @@ codeserver:
 # The workspace is mirrored (rsync, over SSH) to/from the Mac around every
 # command routed there -- needs passwordless (key-based) SSH from this
 # container to the Mac, and `rsync`/an account on the Mac side (both ship
-# with macOS). Requires openssh-client + rsync in the executor image (already
-# in the executor Dockerfile target) and a mounted private key -- see
-# run.sh/unraid-template-executor.xml's "Mac SSH Key" entry.
+# with macOS). openssh-client + rsync are already in the shared image; you
+# still need to drop a private key where the executor container can read
+# it -- see run.sh/unraid-template-executor.xml's "Mac SSH Key" entry (or,
+# simplest, just place it inside Config Dir itself, no extra mount needed).
 # ---------------------------------------------------------------------------
 
 # mac:

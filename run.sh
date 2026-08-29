@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Build the image(s) and (re)start the ingest + worker + planner containers
-# with plain `docker build`/`docker run` -- no docker-compose involved.
+# Build one image and (re)start the ingest + worker + planner + executor
+# containers with plain `docker build`/`docker run` -- no docker-compose
+# involved. All four containers run the same image; which daemon each one
+# runs is just the trailing `python <file>.py` argument on its `docker run`.
 #
 # Usage: ./run.sh
 #
@@ -40,8 +42,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 IMAGE="tududi-bridge:latest"
-PLANNER_IMAGE="tududi-bridge-planner:latest"
-EXECUTOR_IMAGE="tududi-bridge-executor:latest"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/tududi-bridge}"
 CONFIG_DIR="$APPDATA_DIR/config"
 DATA_DIR="$APPDATA_DIR/data"
@@ -63,9 +63,7 @@ else
 fi
 
 echo "== build =="
-docker build --pull --rm --target runtime -t "$IMAGE" .
-docker build --rm --target planner -t "$PLANNER_IMAGE" .
-docker build --rm --target executor -t "$EXECUTOR_IMAGE" .
+docker build --pull --rm -t "$IMAGE" .
 
 echo "== restart containers =="
 docker rm -f tududi-ingest tududi-worker tududi-planner tududi-executor >/dev/null 2>&1 || true
@@ -97,7 +95,7 @@ docker run -d \
   -v "$CONFIG_DIR:/config:ro" \
   -v "$DATA_DIR:/data" \
   -v "$SCRIPT_DIR/prompts:/app/prompts:ro" \
-  "$PLANNER_IMAGE" python planner.py
+  "$IMAGE" python planner.py
 
 docker run -d \
   --name tududi-executor \
@@ -109,7 +107,7 @@ docker run -d \
   -v "$WORKSPACES_DIR:/data/workspaces" \
   -v "$SCRIPT_DIR/prompts:/app/prompts:ro" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  "$EXECUTOR_IMAGE" python executor.py
+  "$IMAGE" python executor.py
 
 echo "== done =="
 docker ps --filter name=tududi-ingest --filter name=tududi-worker --filter name=tududi-planner \
