@@ -54,6 +54,14 @@ class Config:
         self.exec_model = o.get("exec_model", self.model)
         self.exec_num_ctx = o.get("exec_num_ctx", 32768)
         self.exec_temperature = o.get("exec_temperature", 0.2)
+        # Deliberately does NOT fall back to keep_alive (-1, never unload).
+        # Triage polls constantly and benefits from staying warm; execution
+        # is tag-triggered and comparatively rare, so leaving it loaded
+        # forever just means two large models sitting in RAM at once for no
+        # benefit. 10m survives any single step's command execution time
+        # comfortably (default executor.step_timeout is 120s) while still
+        # freeing RAM well before the next infrequent execution run.
+        self.exec_keep_alive = o.get("exec_keep_alive", "10m")
 
         w = raw.get("worker", {})
         self.poll_interval = w.get("poll_interval", 10)

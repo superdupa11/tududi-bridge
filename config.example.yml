@@ -44,6 +44,17 @@ ollama:
   # exec_model: qwen3:30b-a3b
   exec_num_ctx: 32768
   exec_temperature: 0.2
+  # Deliberately NOT -1 like keep_alive above -- execution is tag-triggered
+  # and comparatively rare, unlike triage's constant polling, so there's no
+  # benefit to keeping it loaded indefinitely once idle. If exec_model and
+  # model differ (the normal case), leaving both at keep_alive: -1 means
+  # BOTH sit resident in RAM forever once each has run once -- on a modest
+  # host running everything (Ollama, code-server, this whole pipeline) on
+  # one box, that's real memory pressure for no benefit. 10m survives any
+  # single step's command execution time comfortably (default
+  # executor.step_timeout is 120s) while still freeing RAM well before the
+  # next infrequent execution run.
+  exec_keep_alive: 10m
 
 worker:
   poll_interval: 10
@@ -123,10 +134,15 @@ executor:
   max_attempts: 3
   backoff_base: 120
   stale_after: 1800
-  # Unlike planner_load_threshold, this DOES gate on local box load by
-  # default -- the agent loop drives the same local Ollama host worker.py
-  # uses. 0 disables.
-  load_threshold: 0
+  # Unlike planner_load_threshold, this SHOULD gate on local box load if
+  # everything (Ollama, code-server, this whole pipeline) runs on one host --
+  # the agent loop drives the same local Ollama host worker.py uses, and
+  # also drives real build/test commands in code-server via sandbox.py, so
+  # it's easy for a single run to load up the box more than triage ever
+  # does. 0 disables this check entirely; only prevents STARTING new work
+  # when load is already high, doesn't throttle a run already in progress
+  # (see the --cpus/--memory caps in run.sh/the Unraid templates for that).
+  load_threshold: 6.0
   # quiet_hours: { start: 23, end: 7 }
   max_steps: 40           # hard cap on agent tool-call turns per run (a paused wait doesn't count)
   step_timeout: 120       # seconds, per `run` shell command

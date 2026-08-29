@@ -46,6 +46,17 @@
 #   -v "$HOME/.ssh/tududi_mac_key:/config/mac_ssh_key:ro" \
 # (a `-v` for a file that doesn't exist yet creates an empty directory
 # there instead, which is why this isn't uncommented by default.)
+#
+# Each container below has a --cpus/--memory cap -- all four are lightweight
+# orchestration (HTTP calls, git, occasional rsync); the actual heavy CPU/
+# RAM burn during an execution run happens in Ollama (inference) and
+# code-server (the `docker exec`'d build/test commands), neither of which
+# this repo manages, so cap those too via Unraid's own container settings
+# ("Extra Parameters" takes the same --cpus/--memory flags). The point of
+# capping even these lightweight containers isn't that they need much --
+# it's that a hard --memory limit means a runaway/bugged process gets
+# OOM-killed inside its own container by the kernel, not left free to
+# start eating host RAM until something more important gets picked instead.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,6 +100,7 @@ docker rm -f tududi-ingest tududi-worker tududi-planner tududi-executor >/dev/nu
 docker run -d \
   --name tududi-ingest \
   --restart unless-stopped \
+  --cpus="1.0" --memory="512m" \
   -e TZ=America/Chicago \
   "${ENV_FILE_ARGS[@]}" \
   -v "$CONFIG_DIR:/config:ro" \
@@ -98,6 +110,7 @@ docker run -d \
 docker run -d \
   --name tududi-worker \
   --restart unless-stopped \
+  --cpus="1.0" --memory="1g" \
   -e TZ=America/Chicago \
   "${ENV_FILE_ARGS[@]}" \
   -v "$CONFIG_DIR:/config:ro" \
@@ -108,6 +121,7 @@ docker run -d \
 docker run -d \
   --name tududi-planner \
   --restart unless-stopped \
+  --cpus="1.0" --memory="1g" \
   -e TZ=America/Chicago \
   "${ENV_FILE_ARGS[@]}" \
   -v "$CONFIG_DIR:/config:ro" \
@@ -118,6 +132,7 @@ docker run -d \
 docker run -d \
   --name tududi-executor \
   --restart unless-stopped \
+  --cpus="2.0" --memory="2g" \
   -e TZ=America/Chicago \
   "${ENV_FILE_ARGS[@]}" \
   -v "$CONFIG_DIR:/config:ro" \

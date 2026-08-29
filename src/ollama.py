@@ -14,16 +14,17 @@ class OllamaError(RuntimeError):
 
 
 class Ollama:
-    def __init__(self, cfg, *, model=None, num_ctx=None):
-        """`model`/`num_ctx` let a caller (executor.py) build a client pinned
-        to cfg.exec_model/cfg.exec_num_ctx instead of the triage-sized
-        cfg.model/cfg.num_ctx -- so chat_json() picks up the right settings
-        too via self.model/self.base_options, without chat_json() itself
+    def __init__(self, cfg, *, model=None, num_ctx=None, keep_alive=None):
+        """`model`/`num_ctx`/`keep_alive` let a caller (executor.py) build a
+        client pinned to cfg.exec_model/cfg.exec_num_ctx/cfg.exec_keep_alive
+        instead of the triage-sized cfg.model/cfg.num_ctx/cfg.keep_alive --
+        so chat_json() picks up the right settings too via self.model/
+        self.base_options/self.keep_alive, without chat_json() itself
         needing to change at all."""
         self.base = cfg.ollama_base
         self.model = model or cfg.model
         self.timeout = cfg.request_timeout
-        self.keep_alive = cfg.keep_alive
+        self.keep_alive = keep_alive if keep_alive is not None else cfg.keep_alive
         self.base_options = {
             "num_ctx": num_ctx or cfg.num_ctx,
             "num_thread": cfg.num_thread,

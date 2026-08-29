@@ -539,7 +539,7 @@ def main():
     # The prompt file's model/num_ctx are optional overrides on top of
     # cfg.exec_model/cfg.exec_num_ctx -- see execution.py's ExecPrompt.
     llm = Ollama(cfg, model=prompt.model or cfg.exec_model,
-                num_ctx=prompt.num_ctx or cfg.exec_num_ctx)
+                num_ctx=prompt.num_ctx or cfg.exec_num_ctx, keep_alive=cfg.exec_keep_alive)
 
     try:
         td.ping()

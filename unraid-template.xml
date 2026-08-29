@@ -36,7 +36,7 @@
   <WebUI/>
   <TemplateURL/>
   <Icon/>
-  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <ExtraParams>--restart unless-stopped --cpus="1.0" --memory="1g"</ExtraParams>
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
