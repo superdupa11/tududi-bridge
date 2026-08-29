@@ -14,6 +14,26 @@
 # built from -- the planner refuses to start if it sees one, since Claude
 # Code would otherwise silently prefer it over the subscription token and
 # switch billing to pay-per-token.
+#
+# The executor container mounts /var/run/docker.sock so its default "docker"
+# sandbox backend can `docker exec` into your code-server container -- that
+# grants tududi-executor root-equivalent control of every container on this
+# host, not just code-server. If that's not acceptable, set
+# codeserver.exec_backend: local in config.yml and drop the docker.sock
+# mount below yourself. Either way, WORKSPACES_DIR below must ALSO be
+# bind-mounted into your code-server container, at the path configured as
+# codeserver.workspace_container_root in config.yml -- both containers need
+# to see the same clones for the docker backend's path translation to work.
+#
+# Optional: projects listed under `mac.projects` in config.yml (e.g. an iOS/
+# Flutter project that needs real Xcode/Simulator tooling no Linux container
+# can provide) route to a Mac over SSH instead. Not wired into the docker run
+# below by default -- if you enable `mac:` in config.yml, also add a
+# read-only mount for the private key at whatever path you set as
+# mac.ssh_key, e.g.:
+#   -v "$HOME/.ssh/tududi_mac_key:/config/mac_ssh_key:ro" \
+# (a `-v` for a file that doesn't exist yet creates an empty directory
+# there instead, which is why this isn't uncommented by default.)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,12 +41,14 @@ cd "$SCRIPT_DIR"
 
 IMAGE="tududi-bridge:latest"
 PLANNER_IMAGE="tududi-bridge-planner:latest"
+EXECUTOR_IMAGE="tududi-bridge-executor:latest"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/tududi-bridge}"
 CONFIG_DIR="$APPDATA_DIR/config"
 DATA_DIR="$APPDATA_DIR/data"
+WORKSPACES_DIR="$APPDATA_DIR/workspaces"
 ENV_FILE="$SCRIPT_DIR/.env"
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$DATA_DIR/repos"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$DATA_DIR/repos" "$WORKSPACES_DIR"
 
 if [ ! -f "$CONFIG_DIR/config.yml" ]; then
   echo "missing $CONFIG_DIR/config.yml -- copy config.example.yml there and edit it first" >&2
@@ -43,9 +65,10 @@ fi
 echo "== build =="
 docker build --pull --rm --target runtime -t "$IMAGE" .
 docker build --rm --target planner -t "$PLANNER_IMAGE" .
+docker build --rm --target executor -t "$EXECUTOR_IMAGE" .
 
 echo "== restart containers =="
-docker rm -f tududi-ingest tududi-worker tududi-planner >/dev/null 2>&1 || true
+docker rm -f tududi-ingest tududi-worker tududi-planner tududi-executor >/dev/null 2>&1 || true
 
 docker run -d \
   --name tududi-ingest \
@@ -76,5 +99,18 @@ docker run -d \
   -v "$SCRIPT_DIR/prompts:/app/prompts:ro" \
   "$PLANNER_IMAGE" python planner.py
 
+docker run -d \
+  --name tududi-executor \
+  --restart unless-stopped \
+  -e TZ=America/Chicago \
+  "${ENV_FILE_ARGS[@]}" \
+  -v "$CONFIG_DIR:/config:ro" \
+  -v "$DATA_DIR:/data" \
+  -v "$WORKSPACES_DIR:/data/workspaces" \
+  -v "$SCRIPT_DIR/prompts:/app/prompts:ro" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  "$EXECUTOR_IMAGE" python executor.py
+
 echo "== done =="
-docker ps --filter name=tududi-ingest --filter name=tududi-worker --filter name=tududi-planner
+docker ps --filter name=tududi-ingest --filter name=tududi-worker --filter name=tududi-planner \
+  --filter name=tududi-executor

@@ -14,13 +14,18 @@ class OllamaError(RuntimeError):
 
 
 class Ollama:
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, model=None, num_ctx=None):
+        """`model`/`num_ctx` let a caller (executor.py) build a client pinned
+        to cfg.exec_model/cfg.exec_num_ctx instead of the triage-sized
+        cfg.model/cfg.num_ctx -- so chat_json() picks up the right settings
+        too via self.model/self.base_options, without chat_json() itself
+        needing to change at all."""
         self.base = cfg.ollama_base
-        self.model = cfg.model
+        self.model = model or cfg.model
         self.timeout = cfg.request_timeout
         self.keep_alive = cfg.keep_alive
         self.base_options = {
-            "num_ctx": cfg.num_ctx,
+            "num_ctx": num_ctx or cfg.num_ctx,
             "num_thread": cfg.num_thread,
             "seed": cfg.seed,
             "top_p": 0.9,
@@ -65,6 +70,46 @@ class Ollama:
             return json.loads(content)
         except json.JSONDecodeError as e:
             raise OllamaError(f"unparseable JSON: {e}: {content[:300]}") from e
+
+    def chat_tools(self, messages: list, tools: list, *, model=None, num_ctx=None,
+                   temperature=None, num_predict=None) -> dict:
+        """Tool-calling turn for agent.py's loop. Returns the raw response
+        `message` dict (content + tool_calls) rather than parsed JSON --
+        unlike chat_json(), it's the caller's job to decide whether a turn
+        produced a tool call, plain content, or both, and drive the next
+        turn accordingly.
+
+        chat_json() is deliberately left untouched (worker.py/pipeline.py
+        depend on its exact behaviour) -- this is a separate method, not a
+        new mode bolted onto it.
+        """
+        options = dict(self.base_options)
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
+        if temperature is not None:
+            options["temperature"] = temperature
+        if num_predict is not None:
+            options["num_predict"] = num_predict
+
+        payload = {
+            "model": model or self.model,
+            "stream": False,
+            "tools": tools,
+            "keep_alive": self.keep_alive,
+            "options": options,
+            "messages": messages,
+        }
+        try:
+            r = requests.post(f"{self.base}/api/chat", json=payload, timeout=self.timeout)
+        except requests.RequestException as e:
+            raise OllamaError(f"ollama unreachable: {e}") from e
+        if r.status_code >= 400:
+            raise OllamaError(f"ollama {r.status_code}: {r.text[:400]}")
+
+        message = r.json().get("message")
+        if not message:
+            raise OllamaError("empty message in response")
+        return message
 
     def warm(self):
         """Load the model into RAM so the first real request isn't a cold start."""

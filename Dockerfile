@@ -54,3 +54,37 @@ COPY src/ /app/
 COPY prompts/ /app/prompts/
 
 CMD ["python", "planner.py"]
+
+# ---------------------------------------------------------------------------
+# executor-tools: git (workspace clones, via repos.ensure_workspace_clone) +
+# the docker CLI (so sandbox.py's docker backend can `docker exec` into the
+# code-server container over the mounted socket) + openssh-client/rsync (so
+# sandbox.py's optional "mac" backend can reach a real Mac for projects that
+# need Apple tooling -- Xcode/iOS Simulator -- no Linux container can
+# provide; see config.example.yml's `mac:` section). Deliberately NOT built
+# from planner-tools -- no Claude CLI here, executor.py never shells out to
+# `claude` (see executor.py's module docstring). Built from `base`, before
+# source is copied, for the same cache-locality reason as planner-tools.
+#
+# The docker CLI here only ever talks to a socket mounted in from the host
+# (see run.sh) -- no dockerd runs inside this image.
+# ---------------------------------------------------------------------------
+FROM base AS executor-tools
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git docker.io openssh-client rsync ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV BRIDGE_REPO_CACHE=/data/repos \
+    BRIDGE_WORKSPACES=/data/workspaces
+
+# ---------------------------------------------------------------------------
+# executor: executor-tools + source, copied last for the same cache-locality
+# reason as planner above.
+# ---------------------------------------------------------------------------
+FROM executor-tools AS executor
+
+COPY src/ /app/
+COPY prompts/ /app/prompts/
+
+CMD ["python", "executor.py"]

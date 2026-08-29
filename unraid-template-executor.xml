@@ -1,0 +1,62 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Docker template for the tududi-executor container.
+
+  Build the executor image first (part of ./run.sh, or manually, using the
+  "target executor" build flag with -t tududi-bridge-executor:latest), then
+  add this template via Unraid's Docker tab (Add Container, Template:
+  select this file, or copy it into
+  /boot/config/plugins/dockerMan/templates-user/).
+
+  This container mounts /var/run/docker.sock so its default "docker" sandbox
+  backend can `docker exec` into your code-server container to run agent
+  commands against the project's real toolchain. That grants tududi-executor
+  root-equivalent control of every container on this Unraid host, not just
+  code-server; if that's unacceptable, set codeserver.exec_backend: local
+  in config.yml and remove the Docker Socket mount below.
+
+  The Workspace Dir below must ALSO be bind-mounted into your code-server
+  container, at whatever path you set as codeserver.workspace_container_root
+  in config.yml; both containers need to see the same git clones for the
+  docker backend's path translation (sandbox.py) to work at all. `python
+  discover.py` checks this and fails loudly if it's misconfigured.
+
+  This daemon never shells out to `claude` or needs CLAUDE_CODE_OAUTH_TOKEN;
+  it drives Ollama's own tool-calling API instead (see config.yml's
+  ollama.exec_model/exec_num_ctx).
+
+  If config.yml's `mac:` section is enabled (for a project needing real
+  Xcode/iOS Simulator tooling no Linux container can provide; see
+  mac.projects), also fill in Mac SSH Key below; leave it blank otherwise.
+-->
+<Container version="2">
+  <Name>tududi-executor</Name>
+  <Repository>tududi-bridge-executor:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>Tag-triggered agentic execution for tududi. Polls tududi for tasks tagged execute-me that already carry a completed plan (plan:done), hands the plan to a bounded Ollama tool-calling agent that works inside a persistent git workspace clone, and commits its changes to a bridge/exec-* branch you review in code-server. Runs alongside the tududi-ingest, tududi-worker, and tududi-planner containers from the same tududi-bridge image family.</Overview>
+  <Category>Productivity: Tools:</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>tududi-worker,code-server</Requires>
+
+  <Config Name="Config Dir" Target="/config" Default="/mnt/user/appdata/tududi-bridge/config" Mode="ro" Description="Directory containing config.yml (shared with tududi-ingest/tududi-worker/tududi-planner)" Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Data Dir" Target="/data" Default="/mnt/user/appdata/tududi-bridge/data" Mode="rw" Description="Durable queue DB (shared) plus this container's local repo clone cache" Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Workspace Dir" Target="/data/workspaces" Default="/mnt/user/appdata/tududi-bridge/workspaces" Mode="rw" Description="Persistent git workspace clones the agent works in. Must ALSO be mounted into code-server at codeserver.workspace_container_root (config.yml) -- same host path, two containers." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Prompts Dir" Target="/app/prompts" Default="/mnt/user/appdata/tududi-bridge/prompts" Mode="ro" Description="Prompt templates -- bind-mounted so edits take effect on container restart, no rebuild needed" Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="Docker Socket" Target="/var/run/docker.sock" Default="/var/run/docker.sock" Mode="rw" Description="Lets the docker sandbox backend `docker exec` into your code-server container. Grants root-equivalent host access -- omit only if codeserver.exec_backend is set to local in config.yml." Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="Mac SSH Key" Target="/config/mac_ssh_key" Default="" Mode="ro" Description="Private key for SSH access to the Mac configured under mac.ssh_key in config.yml. Only needed if mac.enabled is true and mac.projects lists a project that needs it. Leave blank otherwise." Type="Path" Display="always" Required="false" Mask="false"/>
+
+  <Config Name="GitHub Token" Target="GITHUB_TOKEN" Default="" Mode="" Description="Read-only, fine-grained personal access token used to clone/push project repos. Push only happens if executor.allow_push is also set true in config.yml." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Timezone" Target="TZ" Default="America/Chicago" Mode="" Description="Container timezone" Type="Variable" Display="always" Required="false" Mask="false"/>
+</Container>

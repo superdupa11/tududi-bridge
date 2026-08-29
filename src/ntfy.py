@@ -7,15 +7,42 @@ questions, and listening for replies on one static reply topic.
 """
 import json
 import logging
+import os
 import time
 
 import requests
 
 log = logging.getLogger("ntfy")
 
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # conservative; ntfy.sh's own default cap is 15MB
+
 
 class NtfyError(RuntimeError):
     pass
+
+
+def publish_file(cfg, topic, file_path, *, message=None, title=None):
+    """Publishes a local file as an ntfy attachment (agent.py's send_update
+    tool) -- e.g. a screenshot or log the agent already produced on disk.
+    `message` becomes the accompanying caption, not the attachment content."""
+    size = os.path.getsize(file_path)
+    if size > MAX_ATTACHMENT_BYTES:
+        raise NtfyError(f"{file_path} is {size} bytes, over the {MAX_ATTACHMENT_BYTES}-byte "
+                        "attachment limit -- send a summary as text instead")
+    headers = {"Filename": os.path.basename(file_path)}
+    if cfg.ntfy_token:
+        headers["Authorization"] = f"Bearer {cfg.ntfy_token}"
+    if message:
+        headers["Message"] = message
+    if title:
+        headers["Title"] = title
+    with open(file_path, "rb") as fh:
+        data = fh.read()
+    try:
+        r = requests.put(f"{cfg.ntfy_base}/{topic}", data=data, headers=headers, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise NtfyError(f"publish_file to {topic}: {e}") from e
 
 
 def publish(cfg, topic, message, *, title=None, tags=None, priority=None):

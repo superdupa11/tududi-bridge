@@ -10,6 +10,7 @@ import sys
 
 import config
 import db
+import sandbox
 from ollama import Ollama
 from tududi import Tududi, TududiError
 
@@ -70,6 +71,46 @@ def main():
     if not cfg.topic_list:
         ok = False
         print("  none -- nothing will be ingested")
+    print()
+
+    print("== executor ==")
+    backend_ok, detail = sandbox.preflight(cfg)
+    print(f"  backend ({cfg.exec_backend}): {detail}")
+    if not backend_ok:
+        ok = False
+
+    try:
+        import requests
+        r = requests.get(f"{cfg.ollama_base}/api/tags", timeout=10)
+        names = [m["name"] for m in r.json().get("models", [])]
+        if cfg.exec_model in names:
+            print(f"  exec model present: {cfg.exec_model}")
+        else:
+            ok = False
+            print(f"  EXEC MODEL MISSING: {cfg.exec_model}")
+            print(f"  available: {', '.join(names) or '(none)'}")
+    except Exception as e:
+        ok = False
+        print(f"  FAILED checking exec model: {e}")
+
+    try:
+        cfg.workspace_root.mkdir(parents=True, exist_ok=True)
+        probe = cfg.workspace_root / ".bridge_write_test"
+        probe.write_text("ok")
+        probe.unlink()
+        print(f"  workspace_root writable: {cfg.workspace_root}")
+    except OSError as e:
+        ok = False
+        print(f"  workspace_root NOT writable: {cfg.workspace_root}: {e}")
+
+    print(f"  exec_queue: {db.exec_stats(conn) or 'empty'}")
+
+    # Informational only -- never flips `ok`. The Mac being offline is an
+    # expected, handled fallback for mac.projects, not misconfiguration.
+    if cfg.mac_enabled:
+        print(f"  mac backend: {sandbox.mac_status(cfg)}")
+        if cfg.mac_projects:
+            print(f"  mac-routed projects: {', '.join(sorted(cfg.mac_projects))}")
 
     sys.exit(0 if ok else 1)
 

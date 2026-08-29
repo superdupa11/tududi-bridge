@@ -36,6 +36,14 @@ ollama:
   seed: 42               # fixed seed -> reproducible triage
   keep_alive: -1         # never unload; an 18GB reload costs minutes
   request_timeout: 900
+  # Execution (below) is agentic tool-calling, not 3-pass triage -- it needs
+  # far more context than num_ctx above, so these deliberately do NOT
+  # inherit it. exec_model falls back to model above if unset; a model sized
+  # for CPU triage may perform poorly as a coding agent, so pull a
+  # coding-capable model and set exec_model explicitly once you've evaluated one.
+  # exec_model: qwen3:30b-a3b
+  exec_num_ctx: 32768
+  exec_temperature: 0.2
 
 worker:
   poll_interval: 10
@@ -71,8 +79,11 @@ github:
   # locally so Claude can read it directly (Read/Grep/Glob) while planning a
   # task in that project. Projects not listed here get no repo grounding.
   repos:
-    10: "yourname/episort"
-    9:  "yourname/binger"
+    10: "superdupa11/episort"
+    9:  "superdupa11/movienight"
+    8:  "superdupa11/manabase-central"
+    2:  "superdupa11/manabase-lgs"
+    1:  "superdupa11/manabase-upkeep"
 
 planner:
   trigger_tag: plan-me   # tag a task with this in the tududi UI to queue it for planning
@@ -87,6 +98,98 @@ planner:
   # quiet_hours: { start: 23, end: 7 }
   max_clarification_rounds: 3
   awaiting_input_reminder_after: 86400   # re-nudge ntfy after 24h unanswered; 0 disables
+
+# ---------------------------------------------------------------------------
+# Agentic execution (tag-triggered, picks up plans the planner already
+# finished). Needs container changes beyond config.yml -- see run.sh/
+# Dockerfile's "executor" target and unraid-template-executor.xml:
+#   - A workspace volume (host dir -> codeserver.workspace_root here) bind-
+#     mounted into BOTH this container and your code-server container (at
+#     codeserver.workspace_container_root there). Same host path, two
+#     containers, so the agent's file changes are visible live in code-server.
+#   - For the default "docker" backend: /var/run/docker.sock mounted into
+#     this container, so it can `docker exec` into code-server. This grants
+#     root-equivalent control of the whole host -- if that's not acceptable,
+#     set codeserver.exec_backend: local instead and skip the socket mount
+#     (commands then run inside this container itself, which needs each
+#     project's toolchain installed, and won't be visible in code-server).
+# ---------------------------------------------------------------------------
+
+executor:
+  trigger_tag: execute-me   # tag a task with this (after it already has plan:done) to queue it
+  poll_interval: 60
+  max_attempts: 3
+  backoff_base: 120
+  stale_after: 1800
+  # Unlike planner_load_threshold, this DOES gate on local box load by
+  # default -- the agent loop drives the same local Ollama host worker.py
+  # uses. 0 disables.
+  load_threshold: 0
+  # quiet_hours: { start: 23, end: 7 }
+  max_steps: 40           # hard cap on agent tool-call turns per run (a paused wait doesn't count)
+  step_timeout: 120       # seconds, per `run` shell command
+  total_timeout: 3600     # seconds of ACTIVE run time (excludes time spent paused for a reply)
+  # `git push` and `docker build`/`docker push` are never automatic -- when
+  # allowed at all (below), every attempt pauses the run and asks for a
+  # yes/no on that run's own ntfy topic (see "Per-run ntfy conversation"
+  # below) instead of executing immediately.
+  allow_push: false       # also requires github.token; false hard-denies git push, no approval offered
+  allow_docker: false     # also gates the executor's own end-of-run push (see allow_push); separate
+  #                         switch from allow_push -- docker build/push is a different capability
+  #                         (image builds, not code pushes). false hard-denies docker build/push too.
+  # allowed_commands: []  # if non-empty, an allowlist of command prefixes
+  # denied_commands: []   # additional denied prefixes, on top of the built-in sudo / rm -rf /
+  # notify_topic: ...     # defaults to ntfy.reply_topic above if unset -- used for the one-line
+  #                         done/needs-review/failed summary; NOT the per-run conversation, see below
+  awaiting_input_reminder_after: 86400   # re-nudge a parked run's own topic after 24h; 0 disables
+
+# ---------------------------------------------------------------------------
+# Per-run ntfy conversation: every execution gets its OWN freshly-generated
+# topic (e.g. exec-<task_id>-<random>), announced once on the topic mapped
+# to the task's project above (or the topic with project_id: null, as a
+# triage/inbox fallback, if the task isn't mapped to any project). Reply on
+# THAT topic, not the project one, to answer a question or approve/deny a
+# push -- any reply on a run's own topic is unambiguous, no prefix needed.
+# Approval replies: anything starting with yes/y/approve/ok/go/lgtm counts
+# as approval; anything else (including no reply at all) is a denial.
+# ---------------------------------------------------------------------------
+
+codeserver:
+  exec_backend: docker    # "docker" (exec into code-server) or "local" (run in this container)
+  container: code-server  # code-server's container name, for `docker exec`
+  workspace_root: /data/workspaces              # path as THIS container sees the shared volume
+  workspace_container_root: /config/workspace   # path as code-server sees the SAME volume
+
+# ---------------------------------------------------------------------------
+# Optional third sandbox backend for projects that need real Apple tooling
+# (Xcode / iOS Simulator) -- structurally impossible inside a Linux
+# container, docker or otherwise. Only ever used for the project_ids listed
+# under `projects` below, and only for a run where the Mac was reachable
+# (a plain TCP check against ssh_port) at that run's very start -- if it
+# isn't, that run falls back to codeserver.exec_backend instead and gets a
+# clearly-flagged note in both the ntfy conversation and the task itself
+# saying Mac-dependent work couldn't be verified. The check doesn't repeat
+# mid-run, so a Mac that drops off partway through doesn't switch backends
+# under the agent.
+#
+# The workspace is mirrored (rsync, over SSH) to/from the Mac around every
+# command routed there -- needs passwordless (key-based) SSH from this
+# container to the Mac, and `rsync`/an account on the Mac side (both ship
+# with macOS). Requires openssh-client + rsync in the executor image (already
+# in the executor Dockerfile target) and a mounted private key -- see
+# run.sh/unraid-template-executor.xml's "Mac SSH Key" entry.
+# ---------------------------------------------------------------------------
+
+# mac:
+#   enabled: false
+#   host: 10.11.10.xxx                      # the Mac's IP/hostname
+#   ssh_user: yourname
+#   ssh_port: 22
+#   ssh_key: /config/mac_ssh_key            # path as the bridge container sees the mounted key
+#   workspace_root: /Users/yourname/tududi-workspaces   # synced clones live here, on the Mac
+#   connect_timeout: 5      # seconds, the reachability check
+#   command_timeout: 900    # seconds, per command AND per rsync pass -- iOS builds are slow
+#   projects: [1]            # project_id(s) to route here, e.g. 1 = Manabase Upkeep (Flutter/iOS)
 
 # Topic -> project. The ntfy topic name IS the routing key AND, on ntfy.sh,
 # effectively a password -- append random characters to every one of these.

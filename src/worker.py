@@ -54,15 +54,24 @@ def process(cfg, conn, td, llm, prompts, row):
     log.info("#%s [%s] %r", row["id"], topic, raw[:70])
     t0 = time.time()
 
-    final, telemetry = pipeline.run(
-        llm, prompts,
-        raw_text=raw,
-        project_name=topic,
-        project_notes=notes,
-        hint_tags=hint_tags,
-        hint_priority=row["hint_priority"],
-        log=lambda m: log.info(m),
-    )
+    # executor.py also drives local Ollama inference and must never overlap
+    # with this -- see db.acquire_ollama_lease's docstring.
+    holder = f"worker:{os.getpid()}"
+    while not db.acquire_ollama_lease(conn, holder, ttl=cfg.request_timeout * 3 + 60):
+        log.info("waiting for ollama lease")
+        time.sleep(2)
+    try:
+        final, telemetry = pipeline.run(
+            llm, prompts,
+            raw_text=raw,
+            project_name=topic,
+            project_notes=notes,
+            hint_tags=hint_tags,
+            hint_priority=row["hint_priority"],
+            log=lambda m: log.info(m),
+        )
+    finally:
+        db.release_ollama_lease(conn, holder)
 
     title = pipeline.render_title(final, raw)
     description = pipeline.render_description(final, raw, topic, captured)

@@ -62,3 +62,57 @@ def ensure_repo_clone(cfg, project_id) -> Path | None:
     except (RepoError, OSError, subprocess.TimeoutExpired) as e:
         log.warning("clone failed for %s (planning without grounding): %s", owner_repo, e)
         return None
+
+
+def ensure_workspace_clone(cfg, project_id) -> Path:
+    """Like ensure_repo_clone(), but for the executor -- and NOT interchangeable
+    with it. ensure_repo_clone() rmtree()s its destination on every planning
+    pass (cfg.repo_cache_dir is meant to be disposable grounding context), so
+    the executor's live workspace -- possibly mid-agent-run, uncommitted work
+    included -- must live under cfg.workspace_root instead, a directory this
+    function never deletes.
+
+    Does a full (non-shallow) clone so branching/committing behave normally
+    (a --depth 1 clone can't push branches cleanly). Raises RepoError if the
+    project has no repo mapping, the clone fails, or an existing workspace is
+    dirty (never silently discards in-progress agent work).
+    """
+    owner_repo = cfg.github_repos.get(str(project_id))
+    if not owner_repo:
+        raise RepoError(f"no repo mapped for project {project_id!r} under github.repos")
+
+    dest = cfg.workspace_root / owner_repo.replace("/", "__")
+
+    if dest.exists():
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=dest,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise RepoError(f"{dest} exists but is not a usable git tree: {r.stderr[-400:]}")
+        if r.stdout.strip():
+            raise RepoError(f"{dest} has uncommitted changes -- refusing to reuse or "
+                            "delete it; resolve manually")
+        return dest
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(
+        ["git", "clone", _clone_url(cfg, owner_repo), str(dest)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if r.returncode != 0:
+        raise RepoError(f"workspace clone failed for {owner_repo}: {r.stderr[-400:]}")
+    if cfg.github_token:
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", f"https://github.com/{owner_repo}.git"],
+            cwd=dest, capture_output=True, text=True, timeout=10,
+        )
+    # A bare container image has no ~/.gitconfig -- git commit still succeeds
+    # (recent git auto-detects a fallback identity from $USER@hostname and
+    # warns on stderr), but that fallback is a meaningless container hostname,
+    # not something anyone reviewing `git log` should have to decode. Set a
+    # real, local (this clone only) identity instead of relying on the
+    # fallback or requiring global container-wide git config.
+    subprocess.run(["git", "config", "user.name", "tududi-executor"],
+                   cwd=dest, capture_output=True, text=True, timeout=10)
+    subprocess.run(["git", "config", "user.email", "tududi-executor@localhost"],
+                   cwd=dest, capture_output=True, text=True, timeout=10)
+    return dest
