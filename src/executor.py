@@ -411,6 +411,13 @@ def process(cfg, conn, td, llm, prompt, row):
                             title="tududi executor: started")
             except ntfy.NtfyError as e:
                 log.warning("#%s announce publish failed (continuing anyway): %s", row["id"], e)
+            # Separate, minimal message with nothing but the bare topic name --
+            # the sentence above reads better, but isn't clean to copy-paste
+            # straight into ntfy's "subscribe to topic" field; this is.
+            try:
+                ntfy.publish(cfg, announce_topic, topic, title="tududi executor: topic")
+            except ntfy.NtfyError as e:
+                log.warning("#%s topic-name publish failed (continuing anyway): %s", row["id"], e)
 
         opening_msg = (f"Started executing '{task_name}' on branch `{branch}`. I'll post "
                       "questions, approvals, and updates here.")
