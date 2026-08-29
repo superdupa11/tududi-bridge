@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Build one image and (re)start the ingest + worker + planner + executor
-# containers with plain `docker build`/`docker run` -- no docker-compose
-# involved. All four containers run the same image; which daemon each one
-# runs is just the trailing `python <file>.py` argument on its `docker run`.
+# Build one image, push it to Docker Hub, and (re)start the ingest + worker
+# + planner + executor containers locally from it -- plain `docker build`/
+# `docker push`/`docker run`, no docker-compose involved. All four
+# containers run the same image; which daemon each one runs is just the
+# trailing `python <file>.py` argument on its `docker run` (Unraid:
+# PostArgs in unraid-template.xml / unraid-template-executor.xml).
+#
+# The push step means Unraid's own "Force Update" button on tududi-planner/
+# tududi-executor (built from those two templates, Repository set to the
+# same $IMAGE tag) also picks up whatever you just built here, without
+# needing to run this script's local `docker run` blocks below at all --
+# both paths end up in sync since they come from the same build+push.
+# Override IMAGE if brianjwalz/tududi-bridge:latest isn't your Docker Hub
+# namespace, and make sure `docker login` has already been done for it.
 #
 # Usage: ./run.sh
 #
@@ -41,7 +51,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-IMAGE="tududi-bridge:latest"
+IMAGE="${IMAGE:-docker.io/brianjwalz/tududi-bridge:latest}"
 APPDATA_DIR="${APPDATA_DIR:-/mnt/user/appdata/tududi-bridge}"
 CONFIG_DIR="$APPDATA_DIR/config"
 DATA_DIR="$APPDATA_DIR/data"
@@ -64,6 +74,14 @@ fi
 
 echo "== build =="
 docker build --pull --rm -t "$IMAGE" .
+
+echo "== push =="
+# Requires `docker login` already done for this account. Pushed so Unraid's
+# Force Update on tududi-planner/tududi-executor (which pull this same tag
+# via their template's Repository field) picks up this exact build --
+# without this, Force Update has nothing new to find and silently keeps
+# running whatever image was there before.
+docker push "$IMAGE"
 
 echo "== restart containers =="
 docker rm -f tududi-ingest tududi-worker tududi-planner tududi-executor >/dev/null 2>&1 || true

@@ -2,13 +2,15 @@
 <!--
   Unraid Docker template for the tududi-planner container.
 
-  Build the shared image first (./run.sh, or manually: `docker build -t
-  tududi-bridge:latest .`, one image for all four tududi-bridge daemons),
-  then add this template via Unraid's Docker tab (Add Container, Template:
-  select this file, or copy it into
-  /boot/config/plugins/dockerMan/templates-user/). PostArgs below is what
-  makes this specific container run planner.py rather than any of the
-  other three daemons that same image can run.
+  Build and push the shared image first (./run.sh, which builds AND pushes
+  to Docker Hub; one image for all four tududi-bridge daemons), then add
+  this template via Unraid's Docker tab (Add Container, Template: select
+  this file, or copy it into /boot/config/plugins/dockerMan/templates-user/).
+  PostArgs below is what makes this specific container run planner.py
+  rather than any of the other three daemons that same image can run.
+  Repository below must match whatever you actually pushed to (see
+  run.sh's IMAGE variable); Unraid's "Force Update" pulls exactly that
+  tag and does nothing useful if it doesn't match your pushed image.
 
   CLAUDE_CODE_OAUTH_TOKEN is the only Claude credential this template
   exposes, and it is a plain container Config variable; there is
@@ -20,7 +22,7 @@
 -->
 <Container version="2">
   <Name>tududi-planner</Name>
-  <Repository>tududi-bridge:latest</Repository>
+  <Repository>docker.io/brianjwalz/tududi-bridge:latest</Repository>
   <PostArgs>python planner.py</PostArgs>
   <Registry/>
   <Network>bridge</Network>

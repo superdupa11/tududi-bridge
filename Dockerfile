@@ -25,11 +25,19 @@ ENV PYTHONUNBUFFERED=1 \
 # host this tradeoff favors one image to build and reason about over three.
 #
 # git: repo/workspace clones (repos.py, both ensure_repo_clone and
-# ensure_workspace_clone). docker.io: sandbox.py's docker backend
+# ensure_workspace_clone). the docker CLI: sandbox.py's docker backend
 # (`docker exec` into code-server over a mounted socket -- the CLI here
 # only ever talks to a socket mounted in from the host, no dockerd runs in
 # this image). openssh-client + rsync: sandbox.py's optional mac backend.
 # curl + the Claude CLI install: planner.py's headless `claude -p` calls.
+#
+# The docker CLI is fetched as Docker's own static binary release, NOT via
+# `apt-get install docker.io` -- as of Debian 13 "trixie" (this image's
+# base moved there via the floating `python:3.12-slim` tag), Debian's
+# docker.io package only ships dockerd/docker-proxy/docker-init, no
+# /usr/bin/docker at all (that split wasn't true on Debian 12 "bookworm",
+# which is what this line originally assumed). The static binary sidesteps
+# depending on any distro's current package composition entirely.
 #
 # Auth for the Claude CLI is via CLAUDE_CODE_OAUTH_TOKEN at runtime (see
 # config.example.yml) -- `claude login`/`claude setup-token` is never run
@@ -42,8 +50,10 @@ ENV PYTHONUNBUFFERED=1 \
 # knowing the isolation is by mount and by code, not by image, now.
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git docker.io openssh-client rsync curl ca-certificates \
+        git openssh-client rsync curl ca-certificates \
     && curl -fsSL https://claude.ai/install.sh | bash \
+    && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+        | tar xz --strip-components=1 -C /usr/local/bin docker/docker \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH=/root/.local/bin:$PATH
