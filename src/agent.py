@@ -292,6 +292,18 @@ def _tool_send_update(ntfy_publish, workspace_root, args):
     return "sent"
 
 
+def _report_progress(ntfy_publish, name, result):
+    """File-changing tools (write_file/edit_file/run) get an unsolicited
+    ntfy ping so a human watching the run's topic sees activity in
+    real time, not just the model's own voluntary send_update calls.
+    list_dir/read_file stay silent -- exploration is high-volume and
+    low-signal compared to actions that actually touch the workspace."""
+    try:
+        ntfy_publish(f"[{name}] {result[:300]}", None)
+    except Exception:  # noqa: BLE001 -- a progress ping must never break the loop
+        pass
+
+
 def _dispatch(cfg, workspace_root, backend, ntfy_publish, name, args):
     try:
         if name == "list_dir":
@@ -299,11 +311,17 @@ def _dispatch(cfg, workspace_root, backend, ntfy_publish, name, args):
         if name == "read_file":
             return _tool_read_file(workspace_root, args)
         if name == "write_file":
-            return _tool_write_file(workspace_root, args)
+            result = _tool_write_file(workspace_root, args)
+            _report_progress(ntfy_publish, name, result)
+            return result
         if name == "edit_file":
-            return _tool_edit_file(workspace_root, args)
+            result = _tool_edit_file(workspace_root, args)
+            _report_progress(ntfy_publish, name, result)
+            return result
         if name == "run":
-            return _tool_run(cfg, workspace_root, backend, args)
+            result = _tool_run(cfg, workspace_root, backend, args)
+            _report_progress(ntfy_publish, name, result)
+            return result
         if name == "send_update":
             return _tool_send_update(ntfy_publish, workspace_root, args)
     except (AgentError, OSError) as e:
@@ -325,14 +343,21 @@ TIMED_OUT_REPORT = {
     "files_changed": [], "commands_run": [], "acceptance_check": [], "confidence": "low",
 }
 
+STOPPED_REPORT = {
+    "summary": "stopped by user request before finish() was called",
+    "files_changed": [], "commands_run": [], "acceptance_check": [], "confidence": "low",
+}
+
 
 def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
-       max_steps=None, resume_messages=None, elapsed_so_far=0.0, steps_so_far=0, backend=None):
+       max_steps=None, resume_messages=None, elapsed_so_far=0.0, steps_so_far=0, backend=None,
+       stop_check=None):
     """Runs the bounded tool loop. Returns (outcome, transcript):
 
       outcome    -- a dict with a "status" key:
                      "done"      -- {"status": "done", "report": {...finish() args...}}
                      "timed_out" -- {"status": "timed_out", "report": {...}}
+                     "stopped"   -- {"status": "stopped", "report": {...}}
                      "parked"    -- {"status": "parked", "kind": "question"|"approval",
                                      "question": str, "pending_command": str|None,
                                      "resume_messages": [...], "elapsed_seconds": float,
@@ -357,6 +382,14 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
     call this loop makes -- executor.py resolves it once per run (e.g.
     "mac" for a reachable Mac-routed project) and passes the same value on
     every resume, so it can't drift mid-run. See sandbox.run()'s docstring.
+
+    `stop_check`, when given, is a zero-arg callable polled once at the top
+    of every loop iteration (same turn-boundary as the total_timeout check
+    below) -- if it returns true, the loop stops before starting the next
+    turn and returns a "stopped" outcome. executor.py backs this with a
+    background ntfy listener on the run's own topic, so a human can halt a
+    run mid-chunk, not just between chunks. Never interrupts a call already
+    in flight -- an in-progress `run` shell command still finishes.
 
     Parking (ask_question / an approval-needing `run`) is only detected in
     the native tool-calling path, not the JSON fallback below -- a model
@@ -393,6 +426,12 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
         if _elapsed() > cfg.executor_total_timeout:
             log.warning("agent loop hit total_timeout after %s step(s) this call", step - 1)
             break
+
+        if stop_check is not None and stop_check():
+            log.info("agent loop stopped by user request after %s step(s) this call", step - 1)
+            transcript.append({"role": "system", "note": "stopped by user request"})
+            return {"status": "stopped", "report": dict(STOPPED_REPORT), "elapsed_seconds": _elapsed(),
+                   "steps_used": steps_so_far + step}, transcript
 
         if not json_fallback:
             try:

@@ -61,13 +61,39 @@ def _block(**kv):
     return "\n".join(out)
 
 
-def build_prompt(prompt: ExecPrompt, *, task_title, plan: dict, workspace_dir) -> str:
+def build_prompt(prompt: ExecPrompt, *, task_title, plan: dict, workspace_dir,
+                 chunk_index: int = 0, prior_summaries: list | None = None) -> str:
+    """When `plan["chunks"]` is present, the model only sees the one chunk at
+    `chunk_index` -- its own steps/acceptance_criteria/files_likely_touched,
+    not the whole plan's -- plus a CHUNK label and, if earlier chunks of the
+    same task already ran, a PRIOR_CHUNKS_SUMMARY of what they reported done
+    (their finish() summaries, fetched by the caller via
+    db.exec_chunk_summaries -- kept short and out of this module on purpose,
+    since execution.py doesn't otherwise touch the DB). A plan without
+    `chunks` (or chunk_index=0 with no prior_summaries, the default) behaves
+    exactly as before chunking existed."""
     plan = plan or {}
-    steps = plan.get("steps") or []
-    ac = plan.get("acceptance_criteria") or []
-    files = plan.get("files_likely_touched") or []
+    chunks = plan.get("chunks") or []
+    if chunks:
+        chunk = chunks[min(chunk_index, len(chunks) - 1)]
+        steps = chunk.get("steps") or []
+        ac = chunk.get("acceptance_criteria") or []
+        files = chunk.get("files_likely_touched") or []
+        title = chunk.get("title") or ""
+        chunk_label = f"chunk {chunk_index + 1} of {len(chunks)}: {title}".strip(": ")
+    else:
+        steps = plan.get("steps") or []
+        ac = plan.get("acceptance_criteria") or []
+        files = plan.get("files_likely_touched") or []
+        chunk_label = None
+
+    prior_block = ("\n".join(f"{i}. {s}" for i, s in enumerate(prior_summaries, 1))
+                   if prior_summaries else None)
+
     body = _block(
         TASK_TITLE=task_title,
+        CHUNK=chunk_label,
+        PRIOR_CHUNKS_SUMMARY=prior_block,
         PLAN_APPROACH=plan.get("approach"),
         PLAN_STEPS="\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1)) if steps else None,
         ACCEPTANCE_CRITERIA="\n".join(f"- {x}" for x in ac) if ac else None,
@@ -121,13 +147,23 @@ def plan_from_note(note: str) -> dict:
 
 def render_report(report: dict, *, branch: str, diffstat: str, model: str, steps_used: int,
                   seconds: float, transcript_excerpt: str, executed_at: str,
-                  backend_note: str = None) -> str:
+                  backend_note: str = None, chunk_index: int = None, chunk_count: int = None,
+                  chunk_title: str = None) -> str:
     """Compose the '## Execution' section appended to the task's existing note.
     `backend_note`, when given (e.g. "Mac backend unreachable, fell back to
     docker -- iOS-specific work could not be verified"), is called out first
-    so it isn't buried under the rest of the report."""
+    so it isn't buried under the rest of the report. `chunk_index`/
+    `chunk_count`/`chunk_title`, when chunk_count > 1, label the heading with
+    this chunk's position so a multi-chunk task's accumulating note reads as
+    a sequence rather than several identical '## Execution' headers."""
     report = report or {}
-    parts = ["## Execution", f"**Branch:** `{branch}`"]
+    if chunk_count and chunk_count > 1:
+        heading = f"## Execution (chunk {(chunk_index or 0) + 1} of {chunk_count})"
+        if chunk_title:
+            heading += f": {chunk_title}"
+    else:
+        heading = "## Execution"
+    parts = [heading, f"**Branch:** `{branch}`"]
 
     if backend_note:
         parts.append(f"**Note:** {backend_note}")

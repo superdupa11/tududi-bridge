@@ -64,6 +64,7 @@ TAG_NEEDS_REVIEW = "exec:needs-review"
 TAG_FAILED = "exec:failed"
 
 _APPROVE_WORDS = {"y", "yes", "approve", "approved", "ok", "okay", "go", "lgtm", "yep", "sure"}
+_STOP_WORDS = {"stop", "cancel", "abort", "halt"}
 
 
 class ExecutorError(RuntimeError):
@@ -117,6 +118,11 @@ def _parse_approval(text: str) -> bool:
     return bool(words) and words[0] in _APPROVE_WORDS
 
 
+def _parse_stop(text: str) -> bool:
+    words = (text or "").strip().lower().split()
+    return bool(words) and words[0] in _STOP_WORDS
+
+
 def _make_ntfy_publish(cfg, topic):
     def _publish(message, attach_path):
         if attach_path:
@@ -156,11 +162,13 @@ def discover(cfg, conn, td):
         task_id = str(task_id)
         plan = db.plan_latest_result_for_task(conn, task_id) or \
               execution.plan_from_note(t.get("note") or "") or {}
+        chunk_count = max(len(plan.get("chunks") or []), 1)
         row_id = db.exec_enqueue(
             conn, tududi_task_id=task_id,
             project_id=t.get("project_id"),
             task_name=t.get("name"),
             plan_json=json.dumps(plan),
+            chunk_count=chunk_count,
         )
         if row_id:
             log.info("discovered task %s -> exec_queue #%s", task_id, row_id)
@@ -192,6 +200,11 @@ def _skip_backend_unavailable(td, conn, row, task_id, task_note, current_tags, o
 
 def _skip_no_changes(td, conn, row, task_id, task_note, current_tags, owned, branch,
                      backend_note=None, transcript=None, report=None):
+    # Also the outcome for a no-op chunk of a chunked plan -- deliberately
+    # does NOT enqueue the next chunk in that case either (this row never
+    # reaches process()'s chunk-chaining branch, which only runs past this
+    # check), same "stop and let a human look" posture as any other
+    # incomplete chunk.
     extra = f" {backend_note}" if backend_note else ""
     note = task_note + (
         f"\n\n## Execution\n_The agent ran but produced no changes on branch `{branch}`.{extra}_"
@@ -224,6 +237,10 @@ def _listener_thread(cfg, row_id, topic):
             text = (msg.get("message") or "").strip()
             if not text:
                 continue
+            if _parse_stop(text):
+                _stop_parked_row(cfg, conn, row_id, topic)
+                log.info("#%s stopped by user while parked", row_id)
+                return
             db.exec_resume_with_reply(conn, row_id, text)
             log.info("#%s resumed by reply on %s", row_id, topic)
             return
@@ -231,8 +248,66 @@ def _listener_thread(cfg, row_id, topic):
         log.error("listener thread for #%s (%s) crashed: %s", row_id, topic, e)
 
 
+def _stop_parked_row(cfg, conn, row_id, topic):
+    """A 'stop' reply while parked on a question/approval ends the run right
+    here instead of resuming -- there's no in-progress agent turn to let
+    finish (see _stop_listener_thread below for that case), so this can
+    mark the row done immediately."""
+    row = db.exec_get(conn, row_id)
+    if row is None:
+        return
+    task_id = row["tududi_task_id"]
+    td = Tududi(cfg)
+    try:
+        task = td.get_task(task_id)
+        current_tags = task.get("tags") or []
+        note = (task.get("note") or "") + (
+            "\n\n## Execution\n_Stopped by user request while awaiting input on branch "
+            f"`{row['branch']}`. The branch/workspace are untouched._"
+        )
+        td.update_task(task_id, note=note,
+                       tags=execution.derive_exec_tags(current_tags, owned_tags(cfg), TAG_NEEDS_REVIEW))
+    except TududiError as e:
+        log.warning("#%s could not update task %s on stop: %s", row_id, task_id, e)
+    db.exec_mark_done(conn, row_id, {"branch": row["branch"], "stopped_by_user": True})
+    try:
+        ntfy.publish(cfg, topic, "Stopped. Tagged for review; the branch/workspace are untouched.",
+                    title="tududi executor")
+    except ntfy.NtfyError:
+        pass
+
+
 def _spawn_listener(cfg, row_id, topic):
     threading.Thread(target=_listener_thread, args=(cfg, row_id, topic), daemon=True).start()
+
+
+def _stop_listener_thread(cfg, topic, stop_requested, run_finished):
+    """Watches a run's own ntfy topic continuously (not just while parked)
+    for a stop word -- see agent.py's stop_check. `run_finished`, set by the
+    caller once agent.run() returns for any reason, backs subscribe_stream's
+    stop_event so this listener's long-poll tears itself down within its
+    short read timeout instead of sitting on the topic forever once the run
+    (or chunk) it was watching is already over."""
+    try:
+        for msg in ntfy.subscribe_stream(cfg, topic, "all", stop_event=run_finished,
+                                         timeout=(10, 20)):
+            text = (msg.get("message") or "").strip()
+            if _parse_stop(text):
+                stop_requested.set()
+                return
+    except Exception as e:  # noqa: BLE001 -- a dead listener thread must not die silently
+        log.error("stop listener for topic %s crashed: %s", topic, e)
+
+
+def _spawn_stop_listener(cfg, topic):
+    """Returns (stop_requested, run_finished) events. Pass stop_requested.is_set
+    as agent.run()'s stop_check; set run_finished once agent.run() returns
+    (any outcome) to tear the listener thread down."""
+    stop_requested = threading.Event()
+    run_finished = threading.Event()
+    threading.Thread(target=_stop_listener_thread, args=(cfg, topic, stop_requested, run_finished),
+                     daemon=True).start()
+    return stop_requested, run_finished
 
 
 def _resume_listeners_on_startup(cfg, conn):
@@ -336,6 +411,9 @@ def process(cfg, conn, td, llm, prompt, row):
     resuming = bool(row["park_kind"])
     prompt_text = None
 
+    chunk_index = row["chunk_index"] or 0
+    chunk_count = row["chunk_count"] or 1
+
     if resuming:
         topic = row["ntfy_topic"]
         workspace_dir = Path(row["workspace_dir"])
@@ -383,57 +461,86 @@ def process(cfg, conn, td, llm, prompt, row):
             plan = db.plan_latest_result_for_task(conn, task_id) or \
                   execution.plan_from_note(task_note) or {}
 
+        plan_chunks = plan.get("chunks") or []
+        chunk_title = plan_chunks[chunk_index].get("title") if chunk_index < len(plan_chunks) else None
+
         workspace_dir = repos.ensure_workspace_clone(cfg, project_id)
 
-        token = gen_token()
-        branch = f"bridge/exec-{task_id}-{token}"
-        _run_git(workspace_dir, ["checkout", _base_branch(workspace_dir)])
-        _run_git(workspace_dir, ["pull", "--ff-only"], check=False)
-        _run_git(workspace_dir, ["checkout", "-b", branch])
+        if chunk_index == 0:
+            token = gen_token()
+            branch = f"bridge/exec-{task_id}-{token}"
+            _run_git(workspace_dir, ["checkout", _base_branch(workspace_dir)])
+            _run_git(workspace_dir, ["pull", "--ff-only"], check=False)
+            _run_git(workspace_dir, ["checkout", "-b", branch])
+        else:
+            # Continuing a chunked task -- stay on the branch earlier chunks
+            # already committed to, never re-branch off base mid-task.
+            branch = row["branch"]
+            _run_git(workspace_dir, ["checkout", branch])
 
         db.exec_set_workspace(conn, row["id"], workspace_dir=str(workspace_dir), branch=branch)
 
-        # Resolved once, here, and persisted -- NOT re-checked on every
-        # resume, so a Mac that drops off the network mid-run doesn't flip
-        # the backend under the agent partway through. See sandbox.py.
-        if str(project_id) in cfg.mac_projects and sandbox.mac_reachable(cfg):
-            run_backend = "mac"
+        if chunk_index == 0:
+            # Resolved once, here, and persisted -- NOT re-checked on every
+            # resume or later chunk, so a Mac that drops off the network
+            # mid-task doesn't flip the backend under the agent partway
+            # through. See sandbox.py.
+            if str(project_id) in cfg.mac_projects and sandbox.mac_reachable(cfg):
+                run_backend = "mac"
+            else:
+                run_backend = cfg.exec_backend
+            db.exec_set_backend(conn, row["id"], run_backend)
         else:
-            run_backend = cfg.exec_backend
-        db.exec_set_backend(conn, row["id"], run_backend)
+            run_backend = row["run_backend"] or cfg.exec_backend
 
-        topic = _new_topic(task_id)
-        db.exec_set_topic(conn, row["id"], topic)
+        if chunk_index == 0:
+            topic = _new_topic(task_id)
+            db.exec_set_topic(conn, row["id"], topic)
 
-        announce_topic = cfg.topic_for_project(project_id)
-        if announce_topic:
+            announce_topic = cfg.topic_for_project(project_id)
+            if announce_topic:
+                try:
+                    ntfy.publish(cfg, announce_topic,
+                                f"Executing '{task_name}' (task {task_id}) on branch `{branch}`.\n"
+                                f"Follow along or reply on this run's own topic: {topic}",
+                                title="tududi executor: started")
+                except ntfy.NtfyError as e:
+                    log.warning("#%s announce publish failed (continuing anyway): %s", row["id"], e)
+                # Separate, minimal message with nothing but the bare topic name --
+                # the sentence above reads better, but isn't clean to copy-paste
+                # straight into ntfy's "subscribe to topic" field; this is.
+                try:
+                    ntfy.publish(cfg, announce_topic, topic, title="tududi executor: topic")
+                except ntfy.NtfyError as e:
+                    log.warning("#%s topic-name publish failed (continuing anyway): %s", row["id"], e)
+
+            opening_msg = (f"Started executing '{task_name}' on branch `{branch}`. I'll post "
+                          "questions, approvals, and updates here. Reply 'stop' any time to "
+                          "halt the run.")
+            if chunk_count > 1:
+                opening_msg += (f"\n\nThis plan runs in {chunk_count} chunks; chunk 1"
+                               f"{f' ({chunk_title})' if chunk_title else ''} is starting now.")
+            backend_note = _backend_note(cfg, project_id, run_backend)
+            if backend_note:
+                opening_msg += f"\n\n{backend_note}"
             try:
-                ntfy.publish(cfg, announce_topic,
-                            f"Executing '{task_name}' (task {task_id}) on branch `{branch}`.\n"
-                            f"Follow along or reply on this run's own topic: {topic}",
-                            title="tududi executor: started")
+                ntfy.publish(cfg, topic, opening_msg, title="tududi executor: started")
             except ntfy.NtfyError as e:
-                log.warning("#%s announce publish failed (continuing anyway): %s", row["id"], e)
-            # Separate, minimal message with nothing but the bare topic name --
-            # the sentence above reads better, but isn't clean to copy-paste
-            # straight into ntfy's "subscribe to topic" field; this is.
+                log.warning("#%s topic-open publish failed (continuing anyway): %s", row["id"], e)
+        else:
+            topic = row["ntfy_topic"]
             try:
-                ntfy.publish(cfg, announce_topic, topic, title="tududi executor: topic")
+                ntfy.publish(cfg, topic,
+                            f"Starting chunk {chunk_index + 1} of {chunk_count}"
+                            f"{f': {chunk_title}' if chunk_title else ''}...",
+                            title="tududi executor")
             except ntfy.NtfyError as e:
-                log.warning("#%s topic-name publish failed (continuing anyway): %s", row["id"], e)
+                log.warning("#%s chunk-start publish failed (continuing anyway): %s", row["id"], e)
 
-        opening_msg = (f"Started executing '{task_name}' on branch `{branch}`. I'll post "
-                      "questions, approvals, and updates here.")
-        backend_note = _backend_note(cfg, project_id, run_backend)
-        if backend_note:
-            opening_msg += f"\n\n{backend_note}"
-        try:
-            ntfy.publish(cfg, topic, opening_msg, title="tududi executor: started")
-        except ntfy.NtfyError as e:
-            log.warning("#%s topic-open publish failed (continuing anyway): %s", row["id"], e)
-
+        prior_summaries = db.exec_chunk_summaries(conn, task_id, chunk_index)
         prompt_text = execution.build_prompt(prompt, task_title=task_name, plan=plan,
-                                             workspace_dir=workspace_dir)
+                                             workspace_dir=workspace_dir, chunk_index=chunk_index,
+                                             prior_summaries=prior_summaries)
         conversation = None
         elapsed_so_far = 0.0
         steps_so_far = 0
@@ -443,13 +550,16 @@ def process(cfg, conn, td, llm, prompt, row):
     while not db.acquire_ollama_lease(conn, holder, ttl=lease_ttl):
         log.info("waiting for ollama lease")
         time.sleep(3)
+    stop_requested, run_finished = _spawn_stop_listener(cfg, topic)
     try:
         outcome, transcript = agent.run(
             cfg, llm, prompt.system, prompt_text, str(workspace_dir), _make_ntfy_publish(cfg, topic),
             max_steps=prompt.max_steps, resume_messages=conversation,
             elapsed_so_far=elapsed_so_far, steps_so_far=steps_so_far, backend=run_backend,
+            stop_check=stop_requested.is_set,
         )
     finally:
+        run_finished.set()
         db.release_ollama_lease(conn, holder)
 
     if outcome["status"] == "parked":
@@ -493,11 +603,15 @@ def process(cfg, conn, td, llm, prompt, row):
     diffstat = _run_git(workspace_dir, ["diff", "--stat", f"{base_branch}...{branch}"],
                         capture=True, check=False) or ""
 
+    plan_chunks = json.loads(row["plan_json"] or "{}").get("chunks") or []
+    chunk_title = plan_chunks[chunk_index].get("title") if chunk_index < len(plan_chunks) else None
+
     executed_at = time.strftime("%Y-%m-%d %H:%M")
     report_section = execution.render_report(
         report, branch=branch, diffstat=diffstat, model=cfg.exec_model, steps_used=steps_used,
         seconds=seconds, transcript_excerpt=_transcript_excerpt(transcript), executed_at=executed_at,
         backend_note=_backend_note(cfg, project_id, run_backend),
+        chunk_index=chunk_index, chunk_count=chunk_count, chunk_title=chunk_title,
     )
     note = task_note + "\n\n" + report_section
 
@@ -505,12 +619,53 @@ def process(cfg, conn, td, llm, prompt, row):
     all_met = bool(checks) and all(
         isinstance(c, dict) and c.get("status") == "met" for c in checks
     )
+    result = {"branch": branch, "summary": report.get("summary"), "acceptance_check": checks,
+             "confidence": report.get("confidence"), "steps_used": steps_used,
+             "seconds": round(seconds, 1)}
+
+    # Only a genuine finish() call ("done") chains to the next chunk -- a
+    # chunk that timed out or was stopped mid-turn goes to needs-review like
+    # any other incomplete run, same as today's single-chunk behavior, rather
+    # than building the next chunk on top of possibly-unfinished work.
+    more_chunks_remain = outcome["status"] == "done" and chunk_index + 1 < chunk_count
+
+    if more_chunks_remain:
+        tags = execution.derive_exec_tags(current_tags, owned, TAG_IN_PROGRESS)
+        td.update_task(task_id, note=note, tags=tags)
+        db.exec_mark_done(conn, row["id"], result, branch=branch, workspace_dir=str(workspace_dir),
+                          transcript=transcript, steps_used=steps_used, elapsed_seconds=seconds)
+        log.info("#%s done -> task %s (chunk %s/%s complete, %s step(s), %.0fs)",
+                row["id"], task_id, chunk_index + 1, chunk_count, steps_used, seconds)
+
+        next_index = chunk_index + 1
+        next_title = (plan_chunks[next_index].get("title")
+                     if next_index < len(plan_chunks) else None)
+        try:
+            ntfy.publish(cfg, topic,
+                        f"Chunk {chunk_index + 1} of {chunk_count} done, continuing to "
+                        f"chunk {next_index + 1}{f': {next_title}' if next_title else ''}...",
+                        title="tududi executor")
+        except ntfy.NtfyError as e:
+            log.warning("#%s chunk-continue publish failed (continuing anyway): %s", row["id"], e)
+
+        next_row_id = db.exec_enqueue(
+            conn, tududi_task_id=task_id, project_id=project_id, task_name=task_name,
+            plan_json=row["plan_json"], chunk_index=next_index, chunk_count=chunk_count,
+            branch=branch, workspace_dir=str(workspace_dir), ntfy_topic=topic,
+            run_backend=run_backend,
+        )
+        if next_row_id:
+            log.info("#%s -> enqueued chunk %s/%s as #%s", row["id"], next_index + 1,
+                    chunk_count, next_row_id)
+        else:
+            log.warning("#%s could not enqueue next chunk (active row already exists for "
+                       "task %s)", row["id"], task_id)
+        return
+
     new_status = TAG_DONE if all_met else TAG_NEEDS_REVIEW
     tags = execution.derive_exec_tags(current_tags, owned, new_status)
     td.update_task(task_id, note=note, tags=tags)
 
-    result = {"branch": branch, "acceptance_check": checks, "confidence": report.get("confidence"),
-             "steps_used": steps_used, "seconds": round(seconds, 1)}
     db.exec_mark_done(conn, row["id"], result, branch=branch, workspace_dir=str(workspace_dir),
                       transcript=transcript, steps_used=steps_used, elapsed_seconds=seconds)
 

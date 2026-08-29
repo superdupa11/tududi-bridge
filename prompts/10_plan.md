@@ -21,17 +21,39 @@ schema:
       type: array
       items:
         type: string
-      description: Ordered, concrete implementation steps. Empty array if needs_clarification is true.
+      description: Ordered, concrete implementation steps -- the full plan, flattened across all chunks below. Empty array if needs_clarification is true.
     acceptance_criteria:
       type: array
       items:
         type: string
-      description: Observable, checkable outcomes.
+      description: Observable, checkable outcomes -- the full plan's, flattened across all chunks below.
     files_likely_touched:
       type: array
       items:
         type: string
       description: Only paths you actually found via Read/Grep/Glob against REPO_DIR, or that TASK_NOTE names directly. Empty array if you are guessing.
+    chunks:
+      type: array
+      items:
+        type: object
+        additionalProperties: false
+        properties:
+          title:
+            type: string
+            description: Short (a few words) label for this chunk, e.g. "Constraint snapshot tooling" or "Admin UI card".
+          steps:
+            type: array
+            items: { type: string }
+            description: This chunk's subset of `steps` above, same wording.
+          acceptance_criteria:
+            type: array
+            items: { type: string }
+            description: This chunk's subset of `acceptance_criteria` above -- only the ones this chunk's own work can satisfy.
+          files_likely_touched:
+            type: array
+            items: { type: string }
+        required: [title, steps, acceptance_criteria, files_likely_touched]
+      description: The plan broken into ordered, independently-executable pieces -- see the Chunking section below. Every plan has at least one chunk, even a trivial single-concern one.
     risks:
       type: array
       items:
@@ -39,7 +61,7 @@ schema:
     out_of_scope:
       type: string
       description: One sentence naming adjacent work this plan explicitly does NOT cover. Empty string if nothing obvious.
-  required: [needs_clarification, questions, approach, steps, acceptance_criteria, files_likely_touched, risks, out_of_scope]
+  required: [needs_clarification, questions, approach, steps, acceptance_criteria, files_likely_touched, chunks, risks, out_of_scope]
 ---
 
 You turn a tududi task into a fully scoped implementation plan another developer — or a coding agent — can pick up cold and execute, or into a short list of blocking questions if you genuinely can't yet.
@@ -61,6 +83,16 @@ You turn a tududi task into a fully scoped implementation plan another developer
 5. **Steps are concrete and ordered.** Someone should be able to work through them top to bottom without re-deriving the approach.
 6. **Acceptance criteria are observable.** Each one verifiable by running something or reading output — not "works correctly" or "is more robust."
 7. **Honest emptiness.** `files_likely_touched` is an empty array, not a guess, when you don't have real basis for it.
+
+## Chunking
+
+`chunks` is what actually gets executed -- each chunk runs as its own bounded agent turn against a smaller, coding-focused model, one at a time, in order, on the same branch. That model can hold one chunk's worth of scope in its head reliably; it cannot reliably hold a 12-file, 13-step plan -- so how you split matters as much as the plan itself.
+
+- **Split when the plan spans clearly separable concerns** -- by layer (SQL/backend/frontend/docs), by subsystem, or by a natural sequence (e.g. "generate the tooling" before "use the tooling to add the missing files" before "wire the new check into the app"). A plan that's genuinely one small, single-concern change gets exactly one chunk containing everything -- don't split for its own sake.
+- **Each chunk must be independently finishable and verifiable.** A chunk may lay groundwork a later chunk builds on (e.g. a code-generation script before the files it generates), but it must never itself require a *later* chunk's work to make sense or to satisfy its own acceptance criteria.
+- **Order chunks the way a careful developer would work through them** -- dependencies (schema before the code that reads it, a generator before its output) before the things that build on them, foundational/infrastructure work before the UI or docs that surface it.
+- **Every acceptance criterion belongs to exactly one chunk.** The chunk it's assigned to is the one whose own work actually makes it verifiable -- not wherever it happens to fit thematically.
+- **Size chunks for a smaller model, not for a human reader.** A handful of concrete steps and a couple of acceptance criteria per chunk is about right; if a single chunk would still touch half the files in `files_likely_touched`, split it further.
 
 ## Bias
 

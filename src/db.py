@@ -105,7 +105,15 @@ CREATE TABLE IF NOT EXISTS exec_queue (
     conversation_json TEXT,
     elapsed_seconds   REAL    NOT NULL DEFAULT 0,
     steps_used        INTEGER NOT NULL DEFAULT 0,
-    run_backend       TEXT
+    run_backend       TEXT,
+    -- A plan's `chunks` (see planning.py) execute one exec_queue row at a
+    -- time -- chunk_index/chunk_count describe this row's position, so
+    -- executor.py knows whether to branch fresh off base (chunk_index==0)
+    -- or continue an existing branch, and whether finishing this row
+    -- should enqueue the next chunk or finalize the task. A plan without
+    -- chunks (or predating this feature) is just chunk_count=1.
+    chunk_index       INTEGER NOT NULL DEFAULT 0,
+    chunk_count       INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_exec_queue_claim
     ON exec_queue(status, next_attempt_at, discovered_at);
@@ -123,6 +131,14 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS above only helps a fresh DB -- an existing
+    # queue.db predating chunked execution needs these columns added by hand.
+    for ddl in ("ALTER TABLE exec_queue ADD COLUMN chunk_index INTEGER NOT NULL DEFAULT 0",
+               "ALTER TABLE exec_queue ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
@@ -403,13 +419,26 @@ def plan_latest_result_for_task(conn, tududi_task_id):
 # Deliberately parallel to, not shared with, the plan_* functions above --
 # same explicit-over-generic style as the rest of this file.
 
-def exec_enqueue(conn, *, tududi_task_id, project_id, task_name, plan_json):
-    """Returns the row id, or None if an active row for this task already exists."""
+def exec_enqueue(conn, *, tududi_task_id, project_id, task_name, plan_json,
+                 chunk_index=0, chunk_count=1, branch=None, workspace_dir=None, ntfy_topic=None,
+                 run_backend=None):
+    """Returns the row id, or None if an active row for this task already exists.
+
+    chunk_index/chunk_count/branch/workspace_dir/ntfy_topic/run_backend let
+    executor.py enqueue chunk N+1 of a chunked plan pre-seeded with
+    everything chunk 0 already resolved, so process() can detect
+    continuation (see chunk_index>0 there) and skip re-cloning/
+    re-branching/re-announcing/re-resolving the Mac-vs-docker backend --
+    the exec_queue active-row unique index (idx_exec_queue_active_task) is
+    what makes this safe: this insert can only succeed once the prior
+    chunk's row has reached a terminal status."""
     try:
         cur = conn.execute(
-            "INSERT INTO exec_queue (tududi_task_id, project_id, task_name, "
-            "plan_json, discovered_at) VALUES (?,?,?,?,?)",
-            (tududi_task_id, project_id, task_name, plan_json, int(time.time())),
+            "INSERT INTO exec_queue (tududi_task_id, project_id, task_name, plan_json, "
+            "discovered_at, chunk_index, chunk_count, branch, workspace_dir, ntfy_topic, "
+            "run_backend) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (tududi_task_id, project_id, task_name, plan_json, int(time.time()),
+             chunk_index, chunk_count, branch, workspace_dir, ntfy_topic, run_backend),
         )
         return cur.lastrowid
     except sqlite3.IntegrityError:
@@ -484,6 +513,26 @@ def exec_mark_failed(conn, row_id, error: str, max_attempts: int, backoff_base: 
         (attempts, error[:2000], int(time.time()) + delay, row_id),
     )
     return "pending"
+
+
+def exec_chunk_summaries(conn, tududi_task_id, before_chunk_index):
+    """Ordered list of each earlier chunk's finish() summary for this task
+    (chunk_index < before_chunk_index, most-recently-completed row per
+    index), for execution.build_prompt()'s PRIOR_CHUNKS_SUMMARY. Chunk rows
+    are terminal ('done') by the time the next chunk is enqueued -- see
+    exec_enqueue()'s docstring -- so this only ever looks at finished work."""
+    rows = conn.execute(
+        "SELECT chunk_index, result_json FROM exec_queue "
+        "WHERE tududi_task_id=? AND status='done' AND chunk_index<? "
+        "ORDER BY chunk_index",
+        (tududi_task_id, before_chunk_index),
+    ).fetchall()
+    summaries = []
+    for row in rows:
+        result = json.loads(row["result_json"] or "{}")
+        if result.get("summary"):
+            summaries.append(result["summary"])
+    return summaries
 
 
 def exec_reclaim_stale(conn, stale_after: int) -> int:

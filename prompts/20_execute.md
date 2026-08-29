@@ -42,6 +42,8 @@ You are executing an already-approved implementation plan inside a git workspace
 - `TASK_TITLE`: the tududi task this plan came from.
 - `PLAN_APPROACH`, `PLAN_STEPS`, `ACCEPTANCE_CRITERIA`, `FILES_LIKELY_TOUCHED`, `OUT_OF_SCOPE`: the plan itself.
 - `WORKSPACE_DIR`: the git working copy you're operating in, already on a fresh branch.
+- `CHUNK` (only present for a multi-chunk plan): your position in the sequence, e.g. "chunk 2 of 4: API endpoint". `PLAN_STEPS`/`ACCEPTANCE_CRITERIA`/`FILES_LIKELY_TOUCHED` above are already scoped to just this chunk -- you are not seeing, and are not responsible for, the rest of the plan.
+- `PRIOR_CHUNKS_SUMMARY` (only present from chunk 2 onward): what each earlier chunk of this same task reported doing, in order. Earlier chunks already committed their work to this same branch -- treat their summaries as ground truth about what already exists, don't redo it, and build on it the way you would any other code you `read_file` first.
 
 ## Rules
 

@@ -63,7 +63,7 @@ def publish(cfg, topic, message, *, title=None, tags=None, priority=None):
         raise NtfyError(f"publish to {topic}: {e}") from e
 
 
-def subscribe_stream(cfg, topic, cursor):
+def subscribe_stream(cfg, topic, cursor, *, stop_event=None, timeout=(10, 300)):
     """Blocking generator, same long-poll + backoff mechanics as
     ingest.py's stream() but scoped to one topic. Yields each ntfy message
     dict as it arrives (already filtered to event=="message"). Tracks its
@@ -71,6 +71,13 @@ def subscribe_stream(cfg, topic, cursor):
     argument, but does not persist it -- the caller owns persistence (via
     db.get_meta/set_meta) and should pass the last-seen cursor back in after
     a process restart.
+
+    `stop_event`, when given, is checked at the top of each reconnect cycle
+    (and between yielded lines) -- setting it lets a caller tear this
+    generator down promptly instead of leaving it blocked forever on a
+    topic nobody's listening for replies on anymore. `timeout` overrides
+    the default (10s connect, 300s read) -- executor.py's stop-listener
+    uses a much shorter read timeout so it notices `stop_event` quickly.
     """
     headers = {}
     if cfg.ntfy_token:
@@ -78,13 +85,17 @@ def subscribe_stream(cfg, topic, cursor):
 
     backoff = 1
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
         url = f"{cfg.ntfy_base}/{topic}/json"
         try:
             with requests.get(url, params={"since": cursor}, headers=headers,
-                              stream=True, timeout=(10, 300)) as r:
+                              stream=True, timeout=timeout) as r:
                 r.raise_for_status()
                 backoff = 1
                 for line in r.iter_lines(decode_unicode=True):
+                    if stop_event is not None and stop_event.is_set():
+                        return
                     if not line:
                         continue
                     try:

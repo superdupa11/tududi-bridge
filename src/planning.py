@@ -74,6 +74,14 @@ def render_plan(plan: dict, task_note: str, repo_label, conversation: dict,
     if plan.get("approach"):
         parts.append("## Approach\n" + plan["approach"].strip())
 
+    chunks = plan.get("chunks") or []
+    if len(chunks) > 1:
+        parts.append("## Execution chunks\n" + "\n".join(
+            f"{i}. **{c.get('title') or f'Chunk {i}'}** "
+            f"({len(c.get('steps') or [])} step(s))"
+            for i, c in enumerate(chunks, 1)
+        ))
+
     steps = plan.get("steps") or []
     if steps:
         parts.append("## Implementation steps\n" +
