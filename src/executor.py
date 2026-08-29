@@ -191,14 +191,17 @@ def _skip_backend_unavailable(td, conn, row, task_id, task_note, current_tags, o
 
 
 def _skip_no_changes(td, conn, row, task_id, task_note, current_tags, owned, branch,
-                     backend_note=None):
+                     backend_note=None, transcript=None, report=None):
     extra = f" {backend_note}" if backend_note else ""
     note = task_note + (
         f"\n\n## Execution\n_The agent ran but produced no changes on branch `{branch}`.{extra}_"
     )
     tags = execution.derive_exec_tags(current_tags, owned, TAG_NEEDS_REVIEW)
     td.update_task(task_id, note=note, tags=tags)
-    db.exec_mark_done(conn, row["id"], {"branch": branch, "no_changes": True}, branch=branch)
+    result = {"branch": branch, "no_changes": True}
+    if report is not None:
+        result["agent_report"] = report
+    db.exec_mark_done(conn, row["id"], result, branch=branch, transcript=transcript)
     log.info("#%s -> task %s: no changes produced on %s", row["id"], task_id, branch)
 
 
@@ -479,7 +482,8 @@ def process(cfg, conn, td, llm, prompt, row):
     porcelain = _run_git(workspace_dir, ["status", "--porcelain"], capture=True)
     if not (porcelain or "").strip():
         _skip_no_changes(td, conn, row, task_id, task_note, current_tags, owned, branch,
-                         backend_note=_backend_note(cfg, project_id, run_backend))
+                         backend_note=_backend_note(cfg, project_id, run_backend),
+                         transcript=transcript, report=report)
         return
 
     _run_git(workspace_dir, ["add", "-A"])
