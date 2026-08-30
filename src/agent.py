@@ -15,13 +15,18 @@ injected) once one arrives. `elapsed_so_far`/`steps_so_far` let the
 step/time budgets span an arbitrarily long pause without resetting or
 double-counting active work.
 
-If the configured model returns no tool_calls two turns in a row -- either
-it doesn't support tool calling, or it just isn't using it -- the loop
-switches to a schema-constrained single-action JSON loop over the existing
-ollama.chat_json(), so the feature doesn't hard-depend on tool-call support.
-That fallback path is inherently a rougher approximation (one action per
-turn, no native tool-result role, and no ask_question/approval parking --
-see run()'s docstring) and hasn't been exercised against a live model yet.
+A turn with no tool_calls is first checked for a well-formed call the model
+wrote as plain message content instead (typically markdown-fenced JSON) --
+see _parse_content_tool_call -- and dispatched for real if found, rather
+than silently discarded (observed live: a dropped-but-correct write_file
+call led the model to confidently report a file as created that was never
+actually written). Only once two turns in a row have neither a real
+tool_calls entry nor a recoverable one does the loop give up on native
+tool calling and switch to a schema-constrained single-action JSON loop
+over the existing ollama.chat_json(), so the feature doesn't hard-depend on
+tool-call support. That fallback path is inherently a rougher approximation
+(one action per turn, no native tool-result role, and no ask_question/
+approval parking -- see run()'s docstring).
 """
 import json
 import logging
@@ -197,6 +202,37 @@ FALLBACK_SCHEMA = {
 NO_TOOL_CALL_NUDGE = ("Call one of the available tools, or call finish() if the work "
                      "is complete.")
 
+_TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+
+
+def _parse_content_tool_call(content):
+    """A model sometimes writes a perfectly well-formed tool call as plain
+    message content (typically markdown-fenced JSON) instead of using
+    tool_calls -- silently discarding that (as the no-tool_calls path used
+    to) means nothing executes while the model believes it already acted,
+    which can cascade into a confidently fabricated finish() report on a
+    change that never actually landed (observed live: a full, correct
+    write_file call written this way was dropped, and the model went on to
+    report the file as created). Same fenced-JSON stripping ollama.chat_json
+    already uses. Returns (name, args) if `content` parses as
+    {"name": <known tool>, "arguments": {...}}, else None."""
+    if not content:
+        return None
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.split("\n", 1)[-1] if text.startswith("json") else text
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    name = parsed.get("name")
+    if name not in _TOOL_NAMES:
+        return None
+    return name, _parse_args(parsed.get("arguments"))
+
 
 class AgentError(RuntimeError):
     pass
@@ -338,6 +374,41 @@ def _parse_args(raw):
     return raw or {}
 
 
+def _handle_tool_call(cfg, workspace_root, backend, ntfy_publish, messages, transcript,
+                      name, args, steps_so_far, step, elapsed_fn):
+    """Executes one resolved tool call (finish/ask_question/everything else
+    via _dispatch), appending to messages/transcript as it goes. Returns an
+    outcome dict if run()'s loop should return immediately (finish,
+    ask_question, or an approval-needing command), or None if it should
+    continue to the next turn. Shared by the native tool_calls loop and
+    _parse_content_tool_call's fallback path below, so a call dispatched
+    either way behaves identically."""
+    if name == "finish":
+        transcript.append({"role": "system", "note": "finish() called"})
+        return {"status": "done", "report": args, "elapsed_seconds": elapsed_fn(),
+               "steps_used": steps_so_far + step}
+
+    if name == "ask_question":
+        question = args.get("question") or "The agent has a question."
+        transcript.append({"role": "system", "note": f"ask_question: {question}"})
+        return {"status": "parked", "kind": "question", "question": question,
+               "pending_command": None, "resume_messages": messages,
+               "elapsed_seconds": elapsed_fn(), "steps_used": steps_so_far + step}
+
+    try:
+        result = _dispatch(cfg, workspace_root, backend, ntfy_publish, name, args)
+    except _NeedsApproval as e:
+        transcript.append({"role": "system", "note": f"approval needed: {e.command}"})
+        return {"status": "parked", "kind": "approval", "question": e.reason,
+               "pending_command": e.command, "resume_messages": messages,
+               "elapsed_seconds": elapsed_fn(), "steps_used": steps_so_far + step}
+
+    tool_msg = {"role": "tool", "name": name, "content": result}
+    messages.append(tool_msg)
+    transcript.append(tool_msg)
+    return None
+
+
 TIMED_OUT_REPORT = {
     "summary": "step or time budget exhausted before finish() was called",
     "files_changed": [], "commands_run": [], "acceptance_check": [], "confidence": "low",
@@ -445,6 +516,22 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
             transcript.append(dict(message))
 
             if not tool_calls:
+                fallback_call = _parse_content_tool_call(message.get("content"))
+                if fallback_call is not None:
+                    name, args = fallback_call
+                    no_tool_call_streak = 0
+                    log.info("model wrote a well-formed %r call as content instead of "
+                            "tool_calls -- dispatching it instead of discarding it", name)
+                    transcript.append({"role": "system",
+                                       "note": f"recovered {name!r} call from message content "
+                                              "(tool_calls was empty)"})
+                    outcome = _handle_tool_call(cfg, workspace_root, backend, ntfy_publish,
+                                                messages, transcript, name, args, steps_so_far,
+                                                step, _elapsed)
+                    if outcome is not None:
+                        return outcome, transcript
+                    continue
+
                 no_tool_call_streak += 1
                 if no_tool_call_streak >= 2:
                     log.warning("model returned no tool_calls twice in a row, "
@@ -459,33 +546,10 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
                 fn = call.get("function", {})
                 name = fn.get("name")
                 args = _parse_args(fn.get("arguments"))
-
-                if name == "finish":
-                    transcript.append({"role": "system", "note": "finish() called"})
-                    return {"status": "done", "report": args, "elapsed_seconds": _elapsed(),
-                           "steps_used": steps_so_far + step}, transcript
-
-                if name == "ask_question":
-                    question = args.get("question") or "The agent has a question."
-                    transcript.append({"role": "system", "note": f"ask_question: {question}"})
-                    return {"status": "parked", "kind": "question", "question": question,
-                           "pending_command": None, "resume_messages": messages,
-                           "elapsed_seconds": _elapsed(),
-                           "steps_used": steps_so_far + step}, transcript
-
-                try:
-                    result = _dispatch(cfg, workspace_root, backend, ntfy_publish, name, args)
-                except _NeedsApproval as e:
-                    transcript.append({"role": "system",
-                                       "note": f"approval needed: {e.command}"})
-                    return {"status": "parked", "kind": "approval", "question": e.reason,
-                           "pending_command": e.command, "resume_messages": messages,
-                           "elapsed_seconds": _elapsed(),
-                           "steps_used": steps_so_far + step}, transcript
-
-                tool_msg = {"role": "tool", "name": name, "content": result}
-                messages.append(tool_msg)
-                transcript.append(tool_msg)
+                outcome = _handle_tool_call(cfg, workspace_root, backend, ntfy_publish, messages,
+                                            transcript, name, args, steps_so_far, step, _elapsed)
+                if outcome is not None:
+                    return outcome, transcript
 
         else:
             history = "\n".join(f"[{m.get('role')}] {json.dumps(m)[:500]}"
