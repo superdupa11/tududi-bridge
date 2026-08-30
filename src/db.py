@@ -113,7 +113,13 @@ CREATE TABLE IF NOT EXISTS exec_queue (
     -- should enqueue the next chunk or finalize the task. A plan without
     -- chunks (or predating this feature) is just chunk_count=1.
     chunk_index       INTEGER NOT NULL DEFAULT 0,
-    chunk_count       INTEGER NOT NULL DEFAULT 1
+    chunk_count       INTEGER NOT NULL DEFAULT 1,
+    -- JSON array of tududi subtask uids, index-aligned with plan["chunks"] --
+    -- created once (all N at once) when chunk 0 starts, carried forward
+    -- unchanged to every later chunk's row the same way branch/workspace_dir/
+    -- ntfy_topic already are. Deliberately not folded into plan_json, which
+    -- stays purely the planner's own output.
+    subtask_uids_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_exec_queue_claim
     ON exec_queue(status, next_attempt_at, discovered_at);
@@ -134,7 +140,8 @@ def connect(path: Path) -> sqlite3.Connection:
     # CREATE TABLE IF NOT EXISTS above only helps a fresh DB -- an existing
     # queue.db predating chunked execution needs these columns added by hand.
     for ddl in ("ALTER TABLE exec_queue ADD COLUMN chunk_index INTEGER NOT NULL DEFAULT 0",
-               "ALTER TABLE exec_queue ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1"):
+               "ALTER TABLE exec_queue ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 1",
+               "ALTER TABLE exec_queue ADD COLUMN subtask_uids_json TEXT"):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
@@ -421,28 +428,34 @@ def plan_latest_result_for_task(conn, tududi_task_id):
 
 def exec_enqueue(conn, *, tududi_task_id, project_id, task_name, plan_json,
                  chunk_index=0, chunk_count=1, branch=None, workspace_dir=None, ntfy_topic=None,
-                 run_backend=None):
+                 run_backend=None, subtask_uids_json=None):
     """Returns the row id, or None if an active row for this task already exists.
 
-    chunk_index/chunk_count/branch/workspace_dir/ntfy_topic/run_backend let
-    executor.py enqueue chunk N+1 of a chunked plan pre-seeded with
-    everything chunk 0 already resolved, so process() can detect
-    continuation (see chunk_index>0 there) and skip re-cloning/
-    re-branching/re-announcing/re-resolving the Mac-vs-docker backend --
-    the exec_queue active-row unique index (idx_exec_queue_active_task) is
-    what makes this safe: this insert can only succeed once the prior
-    chunk's row has reached a terminal status."""
+    chunk_index/chunk_count/branch/workspace_dir/ntfy_topic/run_backend/
+    subtask_uids_json let executor.py enqueue chunk N+1 of a chunked plan
+    pre-seeded with everything chunk 0 already resolved, so process() can
+    detect continuation (see chunk_index>0 there) and skip re-cloning/
+    re-branching/re-announcing/re-resolving the Mac-vs-docker backend/
+    re-creating tududi subtasks -- the exec_queue active-row unique index
+    (idx_exec_queue_active_task) is what makes this safe: this insert can
+    only succeed once the prior chunk's row has reached a terminal status."""
     try:
         cur = conn.execute(
             "INSERT INTO exec_queue (tududi_task_id, project_id, task_name, plan_json, "
             "discovered_at, chunk_index, chunk_count, branch, workspace_dir, ntfy_topic, "
-            "run_backend) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "run_backend, subtask_uids_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (tududi_task_id, project_id, task_name, plan_json, int(time.time()),
-             chunk_index, chunk_count, branch, workspace_dir, ntfy_topic, run_backend),
+             chunk_index, chunk_count, branch, workspace_dir, ntfy_topic, run_backend,
+             subtask_uids_json),
         )
         return cur.lastrowid
     except sqlite3.IntegrityError:
         return None
+
+
+def exec_set_subtask_uids(conn, row_id, subtask_uids_json: str):
+    conn.execute("UPDATE exec_queue SET subtask_uids_json=? WHERE id=?",
+                (subtask_uids_json, row_id))
 
 
 def exec_claim_one(conn):

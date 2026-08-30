@@ -497,6 +497,25 @@ def process(cfg, conn, td, llm, prompt, row):
             topic = _new_topic(task_id)
             db.exec_set_topic(conn, row["id"], topic)
 
+            # All chunk titles are already known from the plan, so create
+            # every chunk's subtask up front rather than lazily as each
+            # chunk starts -- the human sees the whole planned breakdown
+            # immediately in tududi's own Subtasks panel. Best-effort: a
+            # tududi hiccup here must never block the actual code-execution
+            # work below, so any failure just means this run has no subtask
+            # tracking (reports still land in the parent's note as before).
+            if chunk_count > 1:
+                try:
+                    subtask_uids = [
+                        td.create_task(name=f"{task_name} — {chunk.get('title') or 'chunk'}",
+                                       project_id=project_id, parent_task_id=task["id"])
+                        for chunk in plan_chunks
+                    ]
+                    db.exec_set_subtask_uids(conn, row["id"], json.dumps(subtask_uids))
+                except TududiError as e:
+                    log.warning("#%s could not create chunk subtasks (continuing without "
+                               "subtask tracking): %s", row["id"], e)
+
             # Previously this also *published* the topic name (and a
             # sentence naming it) to the project's shared ntfy topic, so a
             # human already watching that topic would see it -- but that
@@ -613,7 +632,30 @@ def process(cfg, conn, td, llm, prompt, row):
         backend_note=_backend_note(cfg, project_id, run_backend),
         chunk_index=chunk_index, chunk_count=chunk_count, chunk_title=chunk_title,
     )
-    note = task_note + "\n\n" + report_section
+    # A chunk with a real subtask gets its report written there instead of
+    # appended to the parent's note -- keeps the parent limited to its
+    # "## Follow along" section and tag transitions, with the detailed
+    # per-chunk report living where it natively belongs. Falls back to the
+    # pre-subtask behavior (report on the parent) when this run has no
+    # subtask tracking (chunk_count==1, or subtask creation failed earlier).
+    subtask_uids = json.loads(row["subtask_uids_json"] or "[]")
+    subtask_uid = subtask_uids[chunk_index] if chunk_index < len(subtask_uids) else None
+
+    if subtask_uid:
+        try:
+            td.update_task(subtask_uid, note=report_section)
+        except TududiError as e:
+            log.warning("#%s could not write report to subtask %s: %s",
+                       row["id"], subtask_uid, e)
+        if outcome["status"] == "done":
+            try:
+                td.update_task(subtask_uid, status=2)
+            except TududiError as e:
+                log.warning("#%s could not mark subtask %s complete: %s",
+                           row["id"], subtask_uid, e)
+        note = task_note
+    else:
+        note = task_note + "\n\n" + report_section
 
     checks = report.get("acceptance_check") or []
     all_met = bool(checks) and all(
@@ -652,7 +694,7 @@ def process(cfg, conn, td, llm, prompt, row):
             conn, tududi_task_id=task_id, project_id=project_id, task_name=task_name,
             plan_json=row["plan_json"], chunk_index=next_index, chunk_count=chunk_count,
             branch=branch, workspace_dir=str(workspace_dir), ntfy_topic=topic,
-            run_backend=run_backend,
+            run_backend=run_backend, subtask_uids_json=row["subtask_uids_json"],
         )
         if next_row_id:
             log.info("#%s -> enqueued chunk %s/%s as #%s", row["id"], next_index + 1,

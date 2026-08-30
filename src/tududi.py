@@ -61,7 +61,13 @@ class Tududi:
         return data
 
     def create_task(self, *, name, project_id=None, note=None,
-                    priority=None, tags=None):
+                    priority=None, tags=None, parent_task_id=None):
+        """`parent_task_id` takes the numeric `id` a GET/create response
+        returns (NOT the `uid` string used everywhere else) -- confirmed
+        live against a real instance: POST with parent_task_id set creates
+        a real subtask, additively, without touching the parent's existing
+        subtasks (unlike PATCHing a `subtasks` array onto the parent, which
+        replaces the whole collection -- don't use that shape)."""
         body = {"name": name[:255]}
         if project_id is not None:
             body["project_id"] = project_id
@@ -71,6 +77,8 @@ class Tududi:
             body["priority"] = priority
         if tags:
             body["tags"] = tags
+        if parent_task_id is not None:
+            body["parent_task_id"] = parent_task_id
         data = self._call("POST", self.paths["create_task"], json=body)
         task = data.get("task", data) if isinstance(data, dict) else {}
         task_id = task.get("uid") or task.get("uuid") or task.get("id")
