@@ -106,6 +106,17 @@ def subscribe_stream(cfg, topic, cursor, *, stop_event=None, timeout=(10, 300)):
                         continue
                     cursor = msg["id"]
                     yield msg
+        except requests.exceptions.Timeout:
+            # Expected, routine event for a short-timeout caller (e.g.
+            # executor.py's stop-listener, timeout=(10, 20)) -- the topic
+            # was simply quiet longer than this listener's own read
+            # timeout, not a real connection problem, so it doesn't warrant
+            # a WARNING or the backoff a genuine failure gets. Reconnecting
+            # immediately (backoff reset, not grown) is also what keeps a
+            # short-timeout listener actually responsive -- growing the
+            # backoff on every idle timeout would silently make it slower
+            # over time, defeating the point of a short timeout at all.
+            backoff = 1
         except Exception as e:
             log.warning("reply stream dropped (%s), reconnecting in %ss", e, backoff)
             time.sleep(backoff)
