@@ -334,6 +334,60 @@ def _nudge_stale_awaiting(cfg, conn):
             log.warning("reminder publish failed for #%s: %s", row["id"], e)
 
 
+def _recover_orphaned_chunks(cfg, conn):
+    """A chunk's row reaching status='done' and its chunk_index+1<chunk_count
+    successor never getting enqueued stalls the whole task forever otherwise
+    -- process()'s chunk-chaining enqueues the next chunk right after marking
+    the current one done, in the same call, so a container restart/crash (or
+    anything else) landing between those two lines leaves exactly this gap,
+    with no active row left for discover()/exec_claim_one() to ever pick up
+    again. Same idea as _resume_listeners_on_startup for parked rows, but run
+    every poll cycle (not just at startup) so it catches this regardless of
+    cause, and it's cheap -- one query, no LLM/agent work involved.
+
+    Only resumes a row whose stored result explicitly recorded
+    outcome_status=="done" (see the result dict built in process()) -- a row
+    that predates that field, or that legitimately halted (timed_out/
+    stopped, which also reach status='done' but were never meant to chain),
+    is left alone rather than guessed at.
+    """
+    rows = conn.execute(
+        "SELECT * FROM exec_queue e1 WHERE status='done' AND chunk_index + 1 < chunk_count "
+        "AND chunk_index = (SELECT MAX(chunk_index) FROM exec_queue e2 "
+        "                    WHERE e2.tududi_task_id = e1.tududi_task_id AND e2.status='done') "
+        "AND tududi_task_id NOT IN "
+        "(SELECT tududi_task_id FROM exec_queue WHERE status IN "
+        "('pending','processing','awaiting_input'))"
+    ).fetchall()
+
+    for row in rows:
+        result = json.loads(row["result_json"] or "{}")
+        if result.get("outcome_status") != "done":
+            continue
+
+        next_index = row["chunk_index"] + 1
+        next_row_id = db.exec_enqueue(
+            conn, tududi_task_id=row["tududi_task_id"], project_id=row["project_id"],
+            task_name=row["task_name"], plan_json=row["plan_json"],
+            chunk_index=next_index, chunk_count=row["chunk_count"],
+            branch=row["branch"], workspace_dir=row["workspace_dir"],
+            ntfy_topic=row["ntfy_topic"], run_backend=row["run_backend"],
+            subtask_uids_json=row["subtask_uids_json"],
+        )
+        if not next_row_id:
+            continue  # active row already exists for this task -- nothing to recover
+        log.warning("#%s -> recovered orphaned chunk chain for task %s: enqueued chunk %s/%s as #%s",
+                   row["id"], row["tududi_task_id"], next_index + 1, row["chunk_count"], next_row_id)
+        if row["ntfy_topic"]:
+            try:
+                ntfy.publish(cfg, row["ntfy_topic"],
+                            f"Resuming after an interruption -- continuing to chunk "
+                            f"{next_index + 1} of {row['chunk_count']}.",
+                            title="tududi executor")
+            except ntfy.NtfyError:
+                pass
+
+
 # ---------- automatic end-of-run push approval ----------
 # Separate, lighter-weight than the exec_queue park/resume machinery above --
 # by this point the agent loop is fully finished and the row is already
@@ -661,9 +715,14 @@ def process(cfg, conn, td, llm, prompt, row):
     all_met = bool(checks) and all(
         isinstance(c, dict) and c.get("status") == "met" for c in checks
     )
+    # outcome_status (not just the generic exec_queue.status='done' every
+    # terminal row gets) is what lets _recover_orphaned_chunks tell a chunk
+    # that genuinely finished via finish() -- and so *should* have chained
+    # to a next chunk that, for whatever reason, never got enqueued -- apart
+    # from one that legitimately halted (timed_out/stopped).
     result = {"branch": branch, "summary": report.get("summary"), "acceptance_check": checks,
              "confidence": report.get("confidence"), "steps_used": steps_used,
-             "seconds": round(seconds, 1)}
+             "seconds": round(seconds, 1), "outcome_status": outcome["status"]}
 
     # Only a genuine finish() call ("done") chains to the next chunk -- a
     # chunk that timed out or was stopped mid-turn goes to needs-review like
@@ -758,6 +817,8 @@ def main():
         n = db.exec_reclaim_stale(conn, cfg.executor_stale_after)
         if n:
             log.warning("reclaimed %s stale row(s)", n)
+
+        _recover_orphaned_chunks(cfg, conn)
 
         reason = should_pause(cfg)
         if reason:
