@@ -83,7 +83,7 @@ class Config:
         # there is exactly one place it can live and one thing to audit.
         self.claude_oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
         self.claude_model = c.get("model", "claude-opus-5")
-        self.claude_cli_timeout = c.get("cli_timeout", 300)
+        self.claude_cli_timeout = c.get("cli_timeout", 600)
         self.claude_max_budget_usd = c.get("max_budget_usd", 0.50)
 
         g = raw.get("github", {})

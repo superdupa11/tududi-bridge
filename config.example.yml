@@ -81,7 +81,14 @@ claude:
   # Code would otherwise silently prefer that over the token and switch
   # billing to pay-per-token.
   model: claude-opus-5
-  cli_timeout: 300
+  # effort: high + real repo exploration (Read/Grep/Glob against REPO_DIR)
+  # already made this a multi-minute call on a non-trivial task; producing
+  # the `chunks` breakdown (see prompts/10_plan.md) on top of the flat plan
+  # adds real reasoning/output, not just a bit more JSON -- 300s started
+  # timing out on a genuinely large task once chunking landed. 600 gives
+  # that combination real headroom; a task this heavy is still worth
+  # scoping right rather than racing the clock.
+  cli_timeout: 600
   max_budget_usd: 0.50   # hard per-call spend cap enforced by the CLI itself
 
 github:
