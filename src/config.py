@@ -189,22 +189,6 @@ class Config:
                 return entry.get("notes", "")
         return ""
 
-    def topic_for_project(self, project_id):
-        """Same reverse-index as notes_for_project, but returns the topic
-        NAME -- how the executor announces a fresh per-run ntfy topic on the
-        channel the human already watches for that project. Falls back to
-        whichever topic maps to project_id: null (the triage/inbox topic,
-        by convention) when project_id is None or unmapped, and finally to
-        executor_notify_topic so an announcement is never silently dropped."""
-        project_id = str(project_id) if project_id is not None else None
-        for topic, entry in self.topics.items():
-            if str(entry.get("project_id")) == project_id:
-                return topic
-        for topic, entry in self.topics.items():
-            if entry.get("project_id") is None:
-                return topic
-        return self.executor_notify_topic
-
 
 def load() -> Config:
     with open(CONFIG_PATH) as fh:

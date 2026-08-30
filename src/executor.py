@@ -497,22 +497,22 @@ def process(cfg, conn, td, llm, prompt, row):
             topic = _new_topic(task_id)
             db.exec_set_topic(conn, row["id"], topic)
 
-            announce_topic = cfg.topic_for_project(project_id)
-            if announce_topic:
-                try:
-                    ntfy.publish(cfg, announce_topic,
-                                f"Executing '{task_name}' (task {task_id}) on branch `{branch}`.\n"
-                                f"Follow along or reply on this run's own topic: {topic}",
-                                title="tududi executor: started")
-                except ntfy.NtfyError as e:
-                    log.warning("#%s announce publish failed (continuing anyway): %s", row["id"], e)
-                # Separate, minimal message with nothing but the bare topic name --
-                # the sentence above reads better, but isn't clean to copy-paste
-                # straight into ntfy's "subscribe to topic" field; this is.
-                try:
-                    ntfy.publish(cfg, announce_topic, topic, title="tududi executor: topic")
-                except ntfy.NtfyError as e:
-                    log.warning("#%s topic-name publish failed (continuing anyway): %s", row["id"], e)
+            # Previously this also *published* the topic name (and a
+            # sentence naming it) to the project's shared ntfy topic, so a
+            # human already watching that topic would see it -- but that
+            # topic doubles as ingest.py's capture inbox, which has no way
+            # to tell a status broadcast from a person texting in a new
+            # idea, so it kept re-capturing these as garbage tasks. The
+            # topic name only needs to reach the one human working this
+            # task, and the task's own note already is that channel.
+            try:
+                td.update_task(task_id, note=task_note + (
+                    f"\n\n## Follow along\n_Executing on branch `{branch}`. Subscribe to this "
+                    f"run's ntfy topic for live updates, or reply on it (questions, push "
+                    f"approvals, or `stop` to halt):_\n\n```\n{topic}\n```"
+                ))
+            except TududiError as e:
+                log.warning("#%s could not write follow-along note: %s", row["id"], e)
 
             opening_msg = (f"Started executing '{task_name}' on branch `{branch}`. I'll post "
                           "questions, approvals, and updates here. Reply 'stop' any time to "
