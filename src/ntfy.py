@@ -45,7 +45,16 @@ def publish_file(cfg, topic, file_path, *, message=None, title=None):
         raise NtfyError(f"publish_file to {topic}: {e}") from e
 
 
-def publish(cfg, topic, message, *, title=None, tags=None, priority=None):
+def publish(cfg, topic, message, *, title=None, tags=None, priority=None) -> str | None:
+    """Returns the published message's own ntfy id (from ntfy's publish
+    response, which mirrors the same shape subscribe_stream's messages
+    have), or None if the response didn't include one. A caller about to
+    spawn a listener on this same topic right after (e.g. a park question
+    or a push-approval request) should pass this as subscribe_stream's
+    cursor -- a plain "now" timestamp has only whole-second precision, and
+    this message can land in the very same second the listener starts
+    watching, letting it see its own outgoing question as if it were the
+    reply. An id-based cursor has no such ambiguity."""
     headers = {}
     if cfg.ntfy_token:
         headers["Authorization"] = f"Bearer {cfg.ntfy_token}"
@@ -61,6 +70,10 @@ def publish(cfg, topic, message, *, title=None, tags=None, priority=None):
         r.raise_for_status()
     except requests.RequestException as e:
         raise NtfyError(f"publish to {topic}: {e}") from e
+    try:
+        return r.json().get("id")
+    except ValueError:
+        return None
 
 
 def subscribe_stream(cfg, topic, cursor, *, stop_event=None, timeout=(10, 300)):

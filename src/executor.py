@@ -66,6 +66,22 @@ TAG_FAILED = "exec:failed"
 _APPROVE_WORDS = {"y", "yes", "approve", "approved", "ok", "okay", "go", "lgtm", "yep", "sure"}
 _STOP_WORDS = {"stop", "cancel", "abort", "halt"}
 
+# Every message this executor (or planner.py) publishes titles it
+# "tududi executor: ..."/"tududi planner: ..." -- a listener waiting for a
+# genuine human reply (park/resume, push approval) must not mistake one of
+# the bridge's own messages on the same topic for that reply. The since
+# cursor each listener spawns with (see _spawn_listener/
+# _maybe_request_push_approval) already excludes the specific message that
+# triggered it, but a later bridge message on the same topic -- e.g.
+# _nudge_stale_awaiting's reminder, published to an already-parked row's
+# topic where a listener has been waiting far longer -- would hit the same
+# flaw without this second check.
+_BRIDGE_TITLE_PREFIX = "tududi "
+
+
+def _is_bridge_message(msg) -> bool:
+    return (msg.get("title") or "").startswith(_BRIDGE_TITLE_PREFIX)
+
 
 class ExecutorError(RuntimeError):
     pass
@@ -234,6 +250,8 @@ def _listener_thread(cfg, row_id, topic, since):
     conn = db.connect(config.DB_PATH)
     try:
         for msg in ntfy.subscribe_stream(cfg, topic, since):
+            if _is_bridge_message(msg):
+                continue
             text = (msg.get("message") or "").strip()
             if not text:
                 continue
@@ -306,6 +324,8 @@ def _stop_listener_thread(cfg, topic, stop_requested, run_finished, since):
     try:
         for msg in ntfy.subscribe_stream(cfg, topic, since, stop_event=run_finished,
                                          timeout=(10, 20)):
+            if _is_bridge_message(msg):
+                continue
             text = (msg.get("message") or "").strip()
             if _parse_stop(text):
                 stop_requested.set()
@@ -417,15 +437,17 @@ def _recover_orphaned_chunks(cfg, conn):
 def _maybe_request_push_approval(cfg, row_id, workspace_dir, branch, topic):
     if not (cfg.executor_allow_push and cfg.github_token) or not topic:
         return
+    since = None
     try:
-        ntfy.publish(cfg, topic,
+        since = ntfy.publish(cfg, topic,
                     f"Approval needed: push branch `{branch}` to origin?\n\n"
                     "Reply 'yes' to push, anything else to skip (the branch stays local).",
                     title="tududi executor: push approval")
     except ntfy.NtfyError as e:
         log.warning("#%s could not request push approval: %s", row_id, e)
         return
-    since = str(int(time.time()))
+    if since is None:
+        since = str(int(time.time()))
     threading.Thread(target=_push_approval_listener,
                      args=(cfg, row_id, topic, str(workspace_dir), branch, since),
                      daemon=True).start()
@@ -434,6 +456,8 @@ def _maybe_request_push_approval(cfg, row_id, workspace_dir, branch, topic):
 def _push_approval_listener(cfg, row_id, topic, workspace_dir, branch, since):
     try:
         for msg in ntfy.subscribe_stream(cfg, topic, since):
+            if _is_bridge_message(msg):
+                continue
             text = (msg.get("message") or "").strip()
             if not text:
                 continue
@@ -669,11 +693,12 @@ def process(cfg, conn, td, llm, prompt, row):
                        f"{outcome['question']}\n\nReply 'yes' to approve, anything else to deny.")
         else:
             park_msg = f"Question: {outcome['question']}\n\nReply on this topic with your answer."
+        park_msg_id = None
         try:
-            ntfy.publish(cfg, topic, park_msg, title="tududi executor: input needed")
+            park_msg_id = ntfy.publish(cfg, topic, park_msg, title="tududi executor: input needed")
         except ntfy.NtfyError as e:
             log.warning("#%s park notification failed: %s", row["id"], e)
-        _spawn_listener(cfg, row["id"], topic)
+        _spawn_listener(cfg, row["id"], topic, since=park_msg_id)
         log.info("#%s parked (%s) -> topic %s", row["id"], outcome["kind"], topic)
         return
 
