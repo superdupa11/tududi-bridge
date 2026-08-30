@@ -619,8 +619,14 @@ def process(cfg, conn, td, llm, prompt, row):
             # topic doubles as ingest.py's capture inbox, which has no way
             # to tell a status broadcast from a person texting in a new
             # idea, so it kept re-capturing these as garbage tasks. The
-            # topic name only needs to reach the one human working this
-            # task, and the task's own note already is that channel.
+            # task's own note is the durable record of the topic name, but
+            # nothing pushes that to anyone -- so also announce it on
+            # executor_notify_topic (the same channel the final done/
+            # needs-review summary already uses below, defaulting to the
+            # planner's own reply topic, NOT one of ingest.py's watched
+            # capture topics) so a human already subscribed there actually
+            # gets told a new run started and which topic to follow,
+            # without reintroducing the capture bug.
             try:
                 td.update_task(task_id, note=task_note + (
                     f"\n\n## Follow along\n_Executing on branch `{branch}`. Subscribe to this "
@@ -629,6 +635,15 @@ def process(cfg, conn, td, llm, prompt, row):
                 ))
             except TududiError as e:
                 log.warning("#%s could not write follow-along note: %s", row["id"], e)
+            if cfg.executor_notify_topic:
+                try:
+                    ntfy.publish(cfg, cfg.executor_notify_topic,
+                                f"Executing '{task_name}' (task {task_id}). Follow along or "
+                                f"reply on this run's own topic:\n\n{topic}",
+                                title="tududi executor: started")
+                except ntfy.NtfyError as e:
+                    log.warning("#%s start-announce publish failed (continuing anyway): %s",
+                               row["id"], e)
 
             opening_msg = (f"Started executing '{task_name}' on branch `{branch}`. I'll post "
                           "questions, approvals, and updates here. Reply 'stop' any time to "
