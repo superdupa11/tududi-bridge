@@ -638,9 +638,12 @@ def exec_touch_awaiting(conn, row_id):
 def exec_awaiting_rows(conn):
     """All currently-parked rows -- used on executor startup to respawn a
     listener thread per row after a restart (in-memory listener threads
-    don't survive one, but the parked DB state does)."""
+    don't survive one, but the parked DB state does). awaiting_since is the
+    listener's ntfy cursor -- a genuine reply may have arrived while the
+    executor was down, so the resumed listener must look back to park time,
+    not just from restart time forward."""
     rows = conn.execute(
-        "SELECT id, ntfy_topic FROM exec_queue WHERE status='awaiting_input'"
+        "SELECT id, ntfy_topic, awaiting_since FROM exec_queue WHERE status='awaiting_input'"
     ).fetchall()
     return [dict(r) for r in rows]
 

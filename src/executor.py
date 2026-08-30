@@ -230,10 +230,10 @@ def _transcript_excerpt(transcript):
 # executor rediscovers which rows still need one, since the parked DB state
 # itself does survive a restart.
 
-def _listener_thread(cfg, row_id, topic):
+def _listener_thread(cfg, row_id, topic, since):
     conn = db.connect(config.DB_PATH)
     try:
-        for msg in ntfy.subscribe_stream(cfg, topic, "all"):
+        for msg in ntfy.subscribe_stream(cfg, topic, since):
             text = (msg.get("message") or "").strip()
             if not text:
                 continue
@@ -277,19 +277,34 @@ def _stop_parked_row(cfg, conn, row_id, topic):
         pass
 
 
-def _spawn_listener(cfg, row_id, topic):
-    threading.Thread(target=_listener_thread, args=(cfg, row_id, topic), daemon=True).start()
+def _spawn_listener(cfg, row_id, topic, since=None):
+    """`since`, when given, is the ntfy cursor to start watching from --
+    pass the row's `awaiting_since` when resuming a listener after a
+    restart, so a reply that arrived while the executor was down is still
+    caught. Defaults to "now" (this instant) for a freshly-parked row,
+    since only a genuinely new reply from here on should count -- using
+    "all" here was the bug: a run's topic accumulates plenty of its own
+    prior traffic (the opening message, progress pings, earlier chunks'
+    messages), and replaying all of that treated old history as an instant
+    (and nonsensical) "reply" to the question, in a tight relaunch loop."""
+    if since is None:
+        since = str(int(time.time()))
+    threading.Thread(target=_listener_thread, args=(cfg, row_id, topic, since),
+                     daemon=True).start()
 
 
-def _stop_listener_thread(cfg, topic, stop_requested, run_finished):
+def _stop_listener_thread(cfg, topic, stop_requested, run_finished, since):
     """Watches a run's own ntfy topic continuously (not just while parked)
     for a stop word -- see agent.py's stop_check. `run_finished`, set by the
     caller once agent.run() returns for any reason, backs subscribe_stream's
     stop_event so this listener's long-poll tears itself down within its
     short read timeout instead of sitting on the topic forever once the run
-    (or chunk) it was watching is already over."""
+    (or chunk) it was watching is already over. `since` (spawn time, not
+    "all") keeps a stray stop word from an earlier chunk's history on this
+    same topic from instantly halting a later chunk it was never meant
+    for -- same class of bug as _spawn_listener's, see its docstring."""
     try:
-        for msg in ntfy.subscribe_stream(cfg, topic, "all", stop_event=run_finished,
+        for msg in ntfy.subscribe_stream(cfg, topic, since, stop_event=run_finished,
                                          timeout=(10, 20)):
             text = (msg.get("message") or "").strip()
             if _parse_stop(text):
@@ -305,15 +320,17 @@ def _spawn_stop_listener(cfg, topic):
     (any outcome) to tear the listener thread down."""
     stop_requested = threading.Event()
     run_finished = threading.Event()
-    threading.Thread(target=_stop_listener_thread, args=(cfg, topic, stop_requested, run_finished),
-                     daemon=True).start()
+    since = str(int(time.time()))
+    threading.Thread(target=_stop_listener_thread,
+                     args=(cfg, topic, stop_requested, run_finished, since), daemon=True).start()
     return stop_requested, run_finished
 
 
 def _resume_listeners_on_startup(cfg, conn):
     for row in db.exec_awaiting_rows(conn):
         if row["ntfy_topic"]:
-            _spawn_listener(cfg, row["id"], row["ntfy_topic"])
+            since = str(row["awaiting_since"]) if row["awaiting_since"] else None
+            _spawn_listener(cfg, row["id"], row["ntfy_topic"], since=since)
             log.info("resumed listener for parked #%s on %s", row["id"], row["ntfy_topic"])
 
 
@@ -408,13 +425,15 @@ def _maybe_request_push_approval(cfg, row_id, workspace_dir, branch, topic):
     except ntfy.NtfyError as e:
         log.warning("#%s could not request push approval: %s", row_id, e)
         return
+    since = str(int(time.time()))
     threading.Thread(target=_push_approval_listener,
-                     args=(cfg, row_id, topic, str(workspace_dir), branch), daemon=True).start()
+                     args=(cfg, row_id, topic, str(workspace_dir), branch, since),
+                     daemon=True).start()
 
 
-def _push_approval_listener(cfg, row_id, topic, workspace_dir, branch):
+def _push_approval_listener(cfg, row_id, topic, workspace_dir, branch, since):
     try:
-        for msg in ntfy.subscribe_stream(cfg, topic, "all"):
+        for msg in ntfy.subscribe_stream(cfg, topic, since):
             text = (msg.get("message") or "").strip()
             if not text:
                 continue
