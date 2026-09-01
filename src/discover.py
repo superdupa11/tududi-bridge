@@ -78,6 +78,8 @@ def main():
     print(f"  backend ({cfg.exec_backend}): {detail}")
     if not backend_ok:
         ok = False
+    else:
+        print(f"  toolchain: {sandbox.toolchain_report(cfg)}")
 
     try:
         import requests
@@ -111,6 +113,7 @@ def main():
         print(f"  mac backend: {sandbox.mac_status(cfg)}")
         if cfg.mac_projects:
             print(f"  mac-routed projects: {', '.join(sorted(cfg.mac_projects))}")
+            print(f"  mac toolchain: {sandbox.toolchain_report(cfg, backend='mac')}")
 
     sys.exit(0 if ok else 1)
 

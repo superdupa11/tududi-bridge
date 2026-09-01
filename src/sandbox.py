@@ -29,6 +29,19 @@ off the network partway through (see executor.py's run_backend column).
               anything the Mac side produces (a regenerated lockfile, e.g.)
               needs to come back before that command's result is trusted.
 
+A workspace root with a `.venv/bin/activate` (see _venv_activate_prefix) gets
+it sourced ahead of every command on the "docker"/"local" backends -- so a
+project gets its own isolated Python environment (create one with `python3
+-m venv .venv`) instead of needing its dependencies baked into the shared
+code-server image, which doesn't scale across projects with conflicting
+version needs. Same idea for Node via `.nvmrc`/`.node-version` (see
+_node_activate_prefix) -- nvm is sourced and pointed at the pinned version,
+installing it first if this machine doesn't have it yet, rather than every
+project sharing whatever single Node build happens to be on PATH. Neither is
+applied to "mac": a venv or nvm-installed Node built here is a Linux one,
+and activating either against the real Mac's interpreter over SSH would be
+worse than not activating anything.
+
 Every backend runs through the same policy gate (allowed/denied command
 prefixes, plus special handling for `git push` / `docker build` / `docker
 push`) before dispatch. A denied command returns a refusal string, same as
@@ -179,6 +192,73 @@ def mac_status(cfg) -> str:
                                                      "fall back to the default backend)")
 
 
+def _venv_activate_prefix(cwd: str) -> str:
+    """A `source .venv/bin/activate && ` prefix if the workspace root has a
+    project-local venv, else "". Only used for the "docker"/"local" backends
+    (see run()) -- both execute against this container's own filesystem view
+    of the bind-mounted workspace, same as the plain stat here, so no extra
+    round-trip is needed to check. The sourced path stays relative so it
+    resolves correctly wherever the command actually runs (this container
+    for "local", or code-server for "docker" -- `-w` already points bash at
+    the same mounted directory).
+
+    Deliberately NOT applied to the "mac" backend: a venv created here is a
+    Linux venv (this container's python3), and activating it on the actual
+    Mac over SSH would point at an interpreter path that doesn't exist
+    there -- worse than no venv at all, not just unhelpful.
+
+    This is the fix for the class of failure preflight's toolchain_report()
+    surfaces (pip/npm missing from code-server's PATH): rather than every
+    project needing its dependencies baked into the shared code-server
+    image, each project gets its own venv at its workspace root, and every
+    command run against it picks the venv's pip/python up automatically."""
+    if (Path(cwd) / ".venv" / "bin" / "activate").is_file():
+        return "source .venv/bin/activate && "
+    return ""
+
+
+def _node_activate_prefix(cwd: str) -> str:
+    """Node's equivalent of _venv_activate_prefix above: if the workspace
+    root pins a version via `.nvmrc`/`.node-version` (nvm's own two
+    supported files -- picked so this recognizes a project's *existing*
+    convention rather than requiring one invented for this bridge), source
+    nvm and `nvm use` (installing that version first if this machine
+    doesn't have it yet) before the command. No such file -> no prefix, same
+    as today: whatever `node`/`npm` resolve to on PATH already.
+
+    Unlike a venv, nvm is a shell *function*, not a binary on PATH, so it
+    has to be re-sourced in every non-interactive `bash -lc` rather than
+    just needing its bin/ directory prepended once -- and unlike checking
+    for `.venv/bin/activate` (always on the shared workspace mount, visible
+    from this process), whether nvm itself is installed can only be checked
+    from wherever the command actually runs (code-server, for the "docker"
+    backend, a container this process can't stat into), so that check has
+    to happen inside the same shell script, at run time, not here in
+    Python. The whole `nvm use`/`nvm install` step is therefore gated on
+    nvm.sh actually existing there -- if it doesn't (nvm was never set up
+    in code-server), this silently no-ops down to whatever `node`/`npm`
+    already resolve to on PATH, same as if the project had no pinned
+    version at all, rather than spamming every command's stderr with
+    "nvm: command not found". When nvm.sh *does* exist, `nvm use`'s output
+    (or the fallback `nvm install`'s) is deliberately left unsuppressed --
+    installing a version this machine has never used before downloads a
+    real Node build, which can be slow, and silently swallowing that means
+    a slow/failed install looks identical to a fast/successful one. Neither
+    call is chained with `&&` into the real command, though: if both fail
+    (bad version, no network, ...) the command still runs against whatever
+    `node`/`npm` happen to be on PATH -- a transient install hiccup
+    shouldn't hard-block every command in the chunk.
+
+    Requires nvm itself already installed in code-server (one-time setup,
+    same as python3-venv for _venv_activate_prefix) -- see
+    https://github.com/nvm-sh/nvm#install--update-script. Not applied to
+    "mac", same reasoning as _venv_activate_prefix."""
+    if not any((Path(cwd) / name).is_file() for name in (".nvmrc", ".node-version")):
+        return ""
+    return ('export NVM_DIR="$HOME/.nvm"; '
+           'if [ -s "$NVM_DIR/nvm.sh" ]; then \\. "$NVM_DIR/nvm.sh"; nvm use || nvm install; fi; ')
+
+
 def _refused(reason: str):
     log.warning("refused command: %s", reason)
     return (1, "", f"refused: {reason}")
@@ -213,6 +293,73 @@ def _check_policy(cfg, command: str):
                         "(only build/push can be approved)")
 
     return "allow", None
+
+
+# Toolchains sandbox.run() commands routinely need -- checked with the same
+# `bash -lc` (or ssh, for "mac") a real run would use, so a login-shell PATH
+# gap (e.g. nvm/pyenv init lines that only ever landed in .bashrc, which a
+# non-interactive login shell doesn't source) shows up here instead of
+# partway through an unattended overnight run. Informational only, like
+# mac_status() below -- not every project needs every tool, so a gap here
+# doesn't fail discover.py's overall ok flag.
+TOOLCHAIN_PROBES = ("git", "python3", "pip3", "node", "npm", "nvm")
+
+
+def _toolchain_probe_command() -> str:
+    checks = [
+        f"if command -v {t} >/dev/null 2>&1; then echo {t}:ok; else echo {t}:missing; fi"
+        for t in TOOLCHAIN_PROBES if t != "nvm"
+    ]
+    # nvm is a shell *function*, not a PATH binary (see
+    # _node_activate_prefix's docstring above) -- a plain `command -v nvm`
+    # never finds it even when installed, so it has to be sourced first,
+    # the same way a real run does.
+    checks.append(
+        'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && \\. "$NVM_DIR/nvm.sh"; '
+        'if command -v nvm >/dev/null 2>&1; then echo nvm:ok; else echo nvm:missing; fi'
+    )
+    return " ; ".join(checks)
+
+
+def toolchain_report(cfg, backend=None) -> str:
+    """Runs a `command -v` probe for TOOLCHAIN_PROBES through the given
+    backend (default cfg.exec_backend) -- the exact way sandbox.run() would
+    dispatch a command on that backend -- and summarizes what's missing.
+    Never raises; a probe that can't even run comes back as text, same as
+    mac_status()."""
+    backend = backend or cfg.exec_backend
+    probe = _toolchain_probe_command()
+
+    if backend == "docker":
+        argv = ["docker", "exec", cfg.codeserver_container, "bash", "-lc", probe]
+    elif backend == "local":
+        argv = ["bash", "-lc", probe]
+    elif backend == "mac":
+        if not mac_reachable(cfg):
+            return "skipped (Mac not reachable)"
+        argv = _mac_ssh_base(cfg) + [probe]
+    else:
+        return f"skipped (unknown backend {backend!r})"
+
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"probe failed: {e}"
+
+    found = {}
+    for line in (r.stdout or "").strip().splitlines():
+        tool, _, status = line.partition(":")
+        if tool in TOOLCHAIN_PROBES:
+            found[tool] = status.strip() == "ok"
+
+    missing = [t for t in TOOLCHAIN_PROBES if not found.get(t)]
+    if missing:
+        present = [t for t in TOOLCHAIN_PROBES if found.get(t)]
+        detail = f"missing on PATH via `bash -lc`: {', '.join(missing)}"
+        if present:
+            detail += f" (present: {', '.join(present)})"
+        return detail
+    return f"all present via `bash -lc`: {', '.join(TOOLCHAIN_PROBES)}"
 
 
 def preflight(cfg):
@@ -267,11 +414,13 @@ def run(cfg, command: str, *, cwd: str, timeout: int, pre_approved: bool = False
     if backend == "mac":
         return _run_mac(cfg, command, cwd=cwd, timeout=timeout)
     if backend == "docker":
+        shell_command = _venv_activate_prefix(cwd) + _node_activate_prefix(cwd) + command
         argv = ["docker", "exec", "-w", _translate_path(cfg, cwd),
-                cfg.codeserver_container, "bash", "-lc", command]
+                cfg.codeserver_container, "bash", "-lc", shell_command]
         run_cwd = None
     elif backend == "local":
-        argv = ["bash", "-lc", command]
+        shell_command = _venv_activate_prefix(cwd) + _node_activate_prefix(cwd) + command
+        argv = ["bash", "-lc", shell_command]
         run_cwd = cwd
     else:
         return _refused(f"unknown backend: {backend!r}")
