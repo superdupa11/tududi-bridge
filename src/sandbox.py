@@ -34,11 +34,13 @@ it sourced ahead of every command on the "docker"/"local" backends -- so a
 project gets its own isolated Python environment (create one with `python3
 -m venv .venv`) instead of needing its dependencies baked into the shared
 code-server image, which doesn't scale across projects with conflicting
-version needs. Same idea for Node via `.nvmrc`/`.node-version` (see
-_node_activate_prefix) -- nvm is sourced and pointed at the pinned version,
-installing it first if this machine doesn't have it yet, rather than every
-project sharing whatever single Node build happens to be on PATH. Neither is
-applied to "mac": a venv or nvm-installed Node built here is a Linux one,
+version needs. Same idea for Node (see _node_activate_prefix) -- if nvm is
+installed, every command runs through it: a `.nvmrc`/`.node-version` pins
+that project to a specific version (installing it first if this machine
+doesn't have it yet), and a project with no pin still gets nvm's own
+default version rather than requiring one shared system-wide Node install.
+Neither is applied to "mac": a venv or nvm-installed Node built here is a
+Linux one,
 and activating either against the real Mac's interpreter over SSH would be
 worse than not activating anything.
 
@@ -218,45 +220,56 @@ def _venv_activate_prefix(cwd: str) -> str:
 
 
 def _node_activate_prefix(cwd: str) -> str:
-    """Node's equivalent of _venv_activate_prefix above: if the workspace
-    root pins a version via `.nvmrc`/`.node-version` (nvm's own two
-    supported files -- picked so this recognizes a project's *existing*
-    convention rather than requiring one invented for this bridge), source
-    nvm and `nvm use` (installing that version first if this machine
-    doesn't have it yet) before the command. No such file -> no prefix, same
-    as today: whatever `node`/`npm` resolve to on PATH already.
+    """Node's equivalent of _venv_activate_prefix above, but unlike a venv
+    this can't gate on a project marker file alone: nvm being installed
+    does NOT put `node`/`npm` on PATH by itself -- merely sourcing nvm.sh
+    only defines the `nvm` shell function, someone still has to call
+    `nvm use`. Most projects don't carry a `.nvmrc`/`.node-version`, so
+    gating the whole prefix on one existing (an earlier version of this
+    function did exactly that) would leave `npm`/`node` "not found" for
+    every unpinned project even with nvm fully installed and a default
+    version set -- silently missing the common case, not just an edge one.
 
-    Unlike a venv, nvm is a shell *function*, not a binary on PATH, so it
-    has to be re-sourced in every non-interactive `bash -lc` rather than
-    just needing its bin/ directory prepended once -- and unlike checking
-    for `.venv/bin/activate` (always on the shared workspace mount, visible
-    from this process), whether nvm itself is installed can only be checked
-    from wherever the command actually runs (code-server, for the "docker"
-    backend, a container this process can't stat into), so that check has
-    to happen inside the same shell script, at run time, not here in
-    Python. The whole `nvm use`/`nvm install` step is therefore gated on
-    nvm.sh actually existing there -- if it doesn't (nvm was never set up
-    in code-server), this silently no-ops down to whatever `node`/`npm`
-    already resolve to on PATH, same as if the project had no pinned
-    version at all, rather than spamming every command's stderr with
-    "nvm: command not found". When nvm.sh *does* exist, `nvm use`'s output
-    (or the fallback `nvm install`'s) is deliberately left unsuppressed --
-    installing a version this machine has never used before downloads a
-    real Node build, which can be slow, and silently swallowing that means
-    a slow/failed install looks identical to a fast/successful one. Neither
-    call is chained with `&&` into the real command, though: if both fail
-    (bad version, no network, ...) the command still runs against whatever
-    `node`/`npm` happen to be on PATH -- a transient install hiccup
-    shouldn't hard-block every command in the chunk.
+    So this always attempts activation when nvm itself is present:
+      - a workspace root with `.nvmrc`/`.node-version` (nvm's own two
+        supported files) gets `nvm use` (installing that version first if
+        this machine doesn't have it yet) -- output left unsuppressed,
+        since installing a version this machine has never used before
+        downloads a real Node build, which can be slow, and silently
+        swallowing that means a slow/failed install looks identical to a
+        fast/successful one;
+      - no such file falls back to `nvm use default` (whatever version the
+        operator last `nvm install`-ed, or `nvm alias default`-ed
+        explicitly) -- output suppressed here, since this runs on every
+        command in every Node project and "Now using node vX" on each one
+        would just be noise, and switching to an already-installed version
+        never downloads anything, so there's no slow-install case to
+        surface.
+    Neither path is chained with `&&` into the real command: if activation
+    fails outright (bad pinned version, no network, no default alias set)
+    the command still runs against whatever `node`/`npm` happen to be on
+    PATH already -- same as before this existed, not a regression.
+
+    Unlike checking for `.venv/bin/activate` (always on the shared
+    workspace mount, visible from this process), whether nvm itself is
+    installed can only be checked from wherever the command actually runs
+    (code-server, for the "docker" backend, a container this process can't
+    stat into), so that check happens inside the shell script itself, at
+    run time -- if nvm.sh doesn't exist there (nvm was never set up in
+    code-server), this whole block silently no-ops down to whatever
+    `node`/`npm` already resolve to on PATH, rather than spamming every
+    command's stderr with "nvm: command not found".
 
     Requires nvm itself already installed in code-server (one-time setup,
     same as python3-venv for _venv_activate_prefix) -- see
     https://github.com/nvm-sh/nvm#install--update-script. Not applied to
     "mac", same reasoning as _venv_activate_prefix."""
-    if not any((Path(cwd) / name).is_file() for name in (".nvmrc", ".node-version")):
-        return ""
+    if any((Path(cwd) / name).is_file() for name in (".nvmrc", ".node-version")):
+        use_step = "nvm use || nvm install"
+    else:
+        use_step = "nvm use default >/dev/null 2>&1"
     return ('export NVM_DIR="$HOME/.nvm"; '
-           'if [ -s "$NVM_DIR/nvm.sh" ]; then \\. "$NVM_DIR/nvm.sh"; nvm use || nvm install; fi; ')
+           f'if [ -s "$NVM_DIR/nvm.sh" ]; then \\. "$NVM_DIR/nvm.sh"; {use_step}; fi; ')
 
 
 def _refused(reason: str):
