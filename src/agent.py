@@ -5,15 +5,19 @@ turn: the model calls a tool, the loop executes it against the workspace
 through sandbox.py, appends the result, and repeats until the model calls
 finish(), or cfg.executor_max_steps / cfg.executor_total_timeout is hit.
 
-Two things can also PAUSE the loop before either of those: the model calling
-`ask_question`, or sandbox.py flagging a `git push`/`docker build`/`docker
-push` as needing human approval. Either way `run()` returns a "parked"
-outcome with the live conversation state instead of a finish() report --
-executor.py persists that, notifies the human on the run's dedicated ntfy
-topic, and calls back into `run()` with `resume_messages` (the reply already
-injected) once one arrives. `elapsed_so_far`/`steps_so_far` let the
-step/time budgets span an arbitrarily long pause without resetting or
-double-counting active work.
+Three things can also PAUSE the loop before either of those: the model
+calling `ask_question`, sandbox.py flagging a `git push`/`docker build`/
+`docker push` as needing human approval, or the loop itself noticing a `run`
+command has failed the exact same way REPEAT_FAILURE_PARK_AT times in a row
+with nothing changed in between and synthesizing an ask_question-shaped
+park instead of letting a small exec model grind through max_steps
+repeating a command that was never going to succeed (see REPEAT_FAILURE_*
+below). Either way `run()` returns a "parked" outcome with the live
+conversation state instead of a finish() report -- executor.py persists
+that, notifies the human on the run's dedicated ntfy topic, and calls back
+into `run()` with `resume_messages` (the reply already injected) once one
+arrives. `elapsed_so_far`/`steps_so_far` let the step/time budgets span an
+arbitrarily long pause without resetting or double-counting active work.
 
 A turn with no tool_calls is first checked for a well-formed call the model
 wrote as plain message content instead (typically markdown-fenced JSON) --
@@ -202,6 +206,25 @@ FALLBACK_SCHEMA = {
 NO_TOOL_CALL_NUDGE = ("Call one of the available tools, or call finish() if the work "
                      "is complete.")
 
+# A model re-issuing the exact same `run` command right after it just failed
+# the identical way means it isn't adapting to the error, not that a retry
+# might succeed (observed live: a small exec model retried `pip install ...`
+# verbatim three times in a row after `pip: command not found`, burning
+# steps instead of noticing pip wasn't on PATH). Nudge once; if it repeats
+# anyway, park the run the same way ask_question does rather than let it
+# grind through max_steps silently -- a human can say "use pip3" or "that's
+# expected, skip it" in seconds.
+REPEAT_FAILURE_NUDGE_AT = 2
+REPEAT_FAILURE_PARK_AT = 3
+REPEAT_FAILURE_NUDGE = (
+    "That exact command just failed the same way it did last time -- repeating it "
+    "verbatim won't produce a different result. Either adapt (a different command, "
+    "installing or locating the missing tool, working around it another way) or, if "
+    "this is a genuine environment limitation you can't work around, stop retrying "
+    "and call finish() with confidence: low explaining what's blocked, per the Bias "
+    "section."
+)
+
 _TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
 
@@ -374,15 +397,34 @@ def _parse_args(raw):
     return raw or {}
 
 
+def _run_exit_code(result: str):
+    """Pulls the exit code back out of _tool_run's `exit=<code>\n...` result
+    string -- avoids widening _dispatch's return contract (a single string,
+    the same shape for every tool) just for one tool's internal detail."""
+    if not result.startswith("exit="):
+        return None
+    head = result.split("\n", 1)[0]
+    try:
+        return int(head[len("exit="):])
+    except ValueError:
+        return None
+
+
 def _handle_tool_call(cfg, workspace_root, backend, ntfy_publish, messages, transcript,
-                      name, args, steps_so_far, step, elapsed_fn):
+                      name, args, steps_so_far, step, elapsed_fn, run_state):
     """Executes one resolved tool call (finish/ask_question/everything else
     via _dispatch), appending to messages/transcript as it goes. Returns an
     outcome dict if run()'s loop should return immediately (finish,
-    ask_question, or an approval-needing command), or None if it should
-    continue to the next turn. Shared by the native tool_calls loop and
-    _parse_content_tool_call's fallback path below, so a call dispatched
-    either way behaves identically."""
+    ask_question, an approval-needing command, or a `run` command that's now
+    failed identically REPEAT_FAILURE_PARK_AT times in a row), or None if it
+    should continue to the next turn. Shared by the native tool_calls loop
+    and _parse_content_tool_call's fallback path below, so a call dispatched
+    either way behaves identically.
+
+    `run_state` is a mutable {"command", "streak"} dict, owned by run()'s
+    caller and threaded through every call this loop makes, that tracks
+    consecutive identical-command `run` failures across turns -- see the
+    REPEAT_FAILURE_* constants above."""
     if name == "finish":
         transcript.append({"role": "system", "note": "finish() called"})
         return {"status": "done", "report": args, "elapsed_seconds": elapsed_fn(),
@@ -406,6 +448,31 @@ def _handle_tool_call(cfg, workspace_root, backend, ntfy_publish, messages, tran
     tool_msg = {"role": "tool", "name": name, "content": result}
     messages.append(tool_msg)
     transcript.append(tool_msg)
+
+    if name == "run":
+        command = args.get("command")
+        failed = _run_exit_code(result) not in (None, 0)
+        if failed and command == run_state["command"]:
+            run_state["streak"] += 1
+        else:
+            run_state["streak"] = 1 if failed else 0
+        run_state["command"] = command
+
+        if run_state["streak"] >= REPEAT_FAILURE_PARK_AT:
+            question = (f"`{command}` has now failed the same way "
+                       f"{run_state['streak']} times in a row with nothing changed "
+                       "in between -- looks like an environment limitation, not "
+                       "something a retry will fix. How should I proceed?")
+            transcript.append({"role": "system",
+                               "note": f"parked: repeated identical run() failure -- {question}"})
+            return {"status": "parked", "kind": "question", "question": question,
+                   "pending_command": None, "resume_messages": messages,
+                   "elapsed_seconds": elapsed_fn(), "steps_used": steps_so_far + step}
+        if run_state["streak"] == REPEAT_FAILURE_NUDGE_AT:
+            nudge = {"role": "user", "content": REPEAT_FAILURE_NUDGE}
+            messages.append(nudge)
+            transcript.append(nudge)
+
     return None
 
 
@@ -462,12 +529,12 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
     run mid-chunk, not just between chunks. Never interrupts a call already
     in flight -- an in-progress `run` shell command still finishes.
 
-    Parking (ask_question / an approval-needing `run`) is only detected in
-    the native tool-calling path, not the JSON fallback below -- a model
-    that doesn't support tool calling at all has no way to distinguish a
-    genuine pause from an ordinary action anyway, so the fallback just runs
-    commands needing approval as deny (see sandbox.py) and has no
-    ask_question equivalent.
+    Parking (ask_question / an approval-needing `run` / a repeated-failure
+    `run`) is only detected in the native tool-calling path, not the JSON
+    fallback below -- a model that doesn't support tool calling at all has no
+    way to distinguish a genuine pause from an ordinary action anyway, so the
+    fallback just runs commands needing approval as deny (see sandbox.py),
+    never dedupes repeated failures, and has no ask_question equivalent.
 
     `llm` is expected to already be constructed with the effective exec
     model/num_ctx (executor.py accounts for the prompt file's optional
@@ -491,6 +558,7 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
     no_tool_call_streak = 0
     json_fallback = False
     step = 0
+    run_state = {"command": None, "streak": 0}
 
     remaining_steps = (max_steps or cfg.executor_max_steps) - steps_so_far
     for step in range(1, max(remaining_steps, 0) + 1):
@@ -527,7 +595,7 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
                                               "(tool_calls was empty)"})
                     outcome = _handle_tool_call(cfg, workspace_root, backend, ntfy_publish,
                                                 messages, transcript, name, args, steps_so_far,
-                                                step, _elapsed)
+                                                step, _elapsed, run_state)
                     if outcome is not None:
                         return outcome, transcript
                     continue
@@ -547,7 +615,8 @@ def run(cfg, llm, system_text, task_prompt, workspace_root, ntfy_publish, *,
                 name = fn.get("name")
                 args = _parse_args(fn.get("arguments"))
                 outcome = _handle_tool_call(cfg, workspace_root, backend, ntfy_publish, messages,
-                                            transcript, name, args, steps_so_far, step, _elapsed)
+                                            transcript, name, args, steps_so_far, step, _elapsed,
+                                            run_state)
                 if outcome is not None:
                     return outcome, transcript
 
