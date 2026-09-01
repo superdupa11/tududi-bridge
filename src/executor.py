@@ -27,6 +27,14 @@ listener thread picks up the first reply on that topic and flips the row
 back to 'pending' with reply_text set -- process() then detects park_kind is
 still set on a freshly-claimed row and resumes instead of starting over.
 
+A third pause (park_kind='backend') happens before the agent loop even
+starts: a Mac-routed project (cfg.mac_projects) whose Mac wasn't reachable
+at chunk 0 parks instead of silently running the whole chunk against the
+fallback backend. Turning the Mac on and replying (any text but 'stop') is a
+genuine retry, not just an acknowledgement -- it re-checks reachability and
+proceeds either way, on the mac backend if it's up now, the fallback
+otherwise.
+
 Deliberately does NOT call assert_no_metered_billing_vars() the way
 planner.py does -- that guard exists because planner.py shells out to the
 Claude Code CLI, which prefers ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN over
@@ -515,30 +523,66 @@ def process(cfg, conn, td, llm, prompt, row):
         topic = row["ntfy_topic"]
         workspace_dir = Path(row["workspace_dir"])
         branch = row["branch"]
-        run_backend = row["run_backend"] or cfg.exec_backend
-        conversation = json.loads(row["conversation_json"] or "[]")
         elapsed_so_far = row["elapsed_seconds"] or 0.0
         steps_so_far = row["steps_used"] or 0
         reply = row["reply_text"] or ""
 
-        if row["park_kind"] == "approval":
-            pending_command = row["pending_command"] or ""
-            if _parse_approval(reply):
-                code, out, err = sandbox.run(cfg, pending_command, cwd=str(workspace_dir),
-                                             timeout=cfg.executor_step_timeout, pre_approved=True,
-                                             backend=run_backend)
-                result_text = f"[approved by human]\nexit={code}\nstdout:\n{out}\nstderr:\n{err}"
+        if row["park_kind"] == "backend":
+            # Parked because a Mac-routed chunk 0 found the Mac unreachable
+            # at run start (see the else: branch's park below) -- there's no
+            # agent conversation to resume (agent.run() was never called yet
+            # for this row), so this just re-checks reachability and falls
+            # through to a fresh chunk-0-style run, same as the else: branch.
+            # ANY reply (besides 'stop', handled generically by the listener
+            # thread) retries: it re-checks the Mac regardless of what was
+            # typed and proceeds either way -- mac if it's reachable now, the
+            # fallback otherwise -- so this never re-parks a second time.
+            if str(project_id) in cfg.mac_projects and sandbox.mac_reachable(cfg):
+                run_backend = "mac"
+                retry_msg = "Mac is reachable now -- continuing on the mac backend."
             else:
-                result_text = f"[denied by human]: {reply or 'no reason given'}"
-            conversation.append({"role": "tool", "name": "run", "content": result_text})
-        else:  # "question"
-            conversation.append({"role": "tool", "name": "ask_question", "content": reply})
+                run_backend = cfg.exec_backend
+                retry_msg = f"Mac still not reachable -- continuing on the {run_backend!r} backend."
+            db.exec_set_backend(conn, row["id"], run_backend)
 
-        td.update_task(task_id, tags=execution.derive_exec_tags(current_tags, owned, TAG_IN_PROGRESS))
-        try:
-            ntfy.publish(cfg, topic, "Got it, continuing...", title="tududi executor")
-        except ntfy.NtfyError as e:
-            log.warning("#%s ack publish failed (continuing anyway): %s", row["id"], e)
+            plan = json.loads(row["plan_json"] or "{}")
+            if not plan:
+                plan = db.plan_latest_result_for_task(conn, task_id) or \
+                      execution.plan_from_note(task_note) or {}
+            prior_summaries = db.exec_chunk_summaries(conn, task_id, chunk_index)
+            prompt_text = execution.build_prompt(prompt, task_title=task_name, plan=plan,
+                                                 workspace_dir=workspace_dir, chunk_index=chunk_index,
+                                                 prior_summaries=prior_summaries)
+            conversation = None
+
+            td.update_task(task_id, tags=execution.derive_exec_tags(current_tags, owned, TAG_IN_PROGRESS))
+            try:
+                ntfy.publish(cfg, topic, retry_msg, title="tududi executor")
+            except ntfy.NtfyError as e:
+                log.warning("#%s backend-retry publish failed (continuing anyway): %s", row["id"], e)
+
+        else:
+            run_backend = row["run_backend"] or cfg.exec_backend
+            conversation = json.loads(row["conversation_json"] or "[]")
+
+            if row["park_kind"] == "approval":
+                pending_command = row["pending_command"] or ""
+                if _parse_approval(reply):
+                    code, out, err = sandbox.run(cfg, pending_command, cwd=str(workspace_dir),
+                                                 timeout=cfg.executor_step_timeout, pre_approved=True,
+                                                 backend=run_backend)
+                    result_text = f"[approved by human]\nexit={code}\nstdout:\n{out}\nstderr:\n{err}"
+                else:
+                    result_text = f"[denied by human]: {reply or 'no reason given'}"
+                conversation.append({"role": "tool", "name": "run", "content": result_text})
+            else:  # "question"
+                conversation.append({"role": "tool", "name": "ask_question", "content": reply})
+
+            td.update_task(task_id, tags=execution.derive_exec_tags(current_tags, owned, TAG_IN_PROGRESS))
+            try:
+                ntfy.publish(cfg, topic, "Got it, continuing...", title="tududi executor")
+            except ntfy.NtfyError as e:
+                log.warning("#%s ack publish failed (continuing anyway): %s", row["id"], e)
 
     else:
         if planner.TAG_DONE not in current_tags:
@@ -652,8 +696,6 @@ def process(cfg, conn, td, llm, prompt, row):
                 opening_msg += (f"\n\nThis plan runs in {chunk_count} chunks; chunk 1"
                                f"{f' ({chunk_title})' if chunk_title else ''} is starting now.")
             backend_note = _backend_note(cfg, project_id, run_backend)
-            if backend_note:
-                opening_msg += f"\n\n{backend_note}"
             try:
                 ntfy.publish(cfg, topic, opening_msg, title="tududi executor: started")
             except ntfy.NtfyError as e:
@@ -675,6 +717,37 @@ def process(cfg, conn, td, llm, prompt, row):
         conversation = None
         elapsed_so_far = 0.0
         steps_so_far = 0
+
+        if chunk_index == 0 and backend_note:
+            # Mac-routed project, Mac unreachable at run start -- pause here
+            # (branch/workspace/topic/opening message/subtasks above are
+            # already in place) rather than silently grinding the whole
+            # chunk through the fallback backend. Any reply (besides 'stop')
+            # retries -- see the "backend" park_kind handling under
+            # `if resuming:` above, which re-checks reachability regardless
+            # of what was typed and proceeds either way, so this never loops
+            # back into a second park.
+            db.exec_park_awaiting(
+                conn, row["id"], kind="backend",
+                question=f"{backend_note} Reply to retry once the Mac's back up, or 'stop' to halt.",
+                pending_command=None, conversation_json="[]",
+                elapsed_seconds=0.0, steps_used=0,
+            )
+            fresh_tags = td.get_task(task_id).get("tags") or []
+            td.update_task(task_id, tags=execution.derive_exec_tags(fresh_tags, owned,
+                                                                     TAG_AWAITING_INPUT))
+            park_msg_id = None
+            try:
+                park_msg_id = ntfy.publish(cfg, topic,
+                            f"{backend_note}\n\nTurn the Mac on and reply 'continue' to retry on "
+                            f"it, or reply anything else to proceed on the {run_backend!r} "
+                            "backend now. Reply 'stop' to halt instead.",
+                            title="tududi executor: input needed")
+            except ntfy.NtfyError as e:
+                log.warning("#%s backend-park notification failed: %s", row["id"], e)
+            _spawn_listener(cfg, row["id"], topic, since=park_msg_id)
+            log.info("#%s parked (backend) -> topic %s", row["id"], topic)
+            return
 
     holder = f"executor:{os.getpid()}"
     lease_ttl = max(cfg.executor_total_timeout - elapsed_so_far, 60) + 120
