@@ -116,3 +116,35 @@ def ensure_workspace_clone(cfg, project_id) -> Path:
     subprocess.run(["git", "config", "user.email", "tududi-executor@localhost"],
                    cwd=dest, capture_output=True, text=True, timeout=10)
     return dest
+
+
+def push_branch(cfg, workspace_dir, branch) -> subprocess.CompletedProcess:
+    """Pushes `branch` to origin, temporarily re-injecting the GitHub token
+    into the remote URL for just the duration of the push.
+
+    ensure_workspace_clone() scrubs the token from origin right after cloning
+    (same reasoning as ensure_repo_clone: don't leave it sitting in
+    .git/config for however long the workspace sticks around, since it's
+    browsable via code-server) -- so push time is the one moment the token
+    needs to come back. Always restores the scrubbed URL afterward, whether
+    the push succeeds or not.
+    """
+    r = subprocess.run(["git", "remote", "get-url", "origin"], cwd=workspace_dir,
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        return r
+    bare_url = r.stdout.strip()
+    authed_url = bare_url
+    if cfg.github_token and bare_url.startswith("https://"):
+        authed_url = bare_url.replace(
+            "https://", f"https://x-access-token:{cfg.github_token}@", 1)
+    try:
+        if authed_url != bare_url:
+            subprocess.run(["git", "remote", "set-url", "origin", authed_url],
+                           cwd=workspace_dir, capture_output=True, text=True, timeout=10)
+        return subprocess.run(["git", "push", "-u", "origin", branch], cwd=workspace_dir,
+                              capture_output=True, text=True, timeout=120)
+    finally:
+        if authed_url != bare_url:
+            subprocess.run(["git", "remote", "set-url", "origin", bare_url],
+                           cwd=workspace_dir, capture_output=True, text=True, timeout=10)

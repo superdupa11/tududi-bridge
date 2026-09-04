@@ -470,8 +470,7 @@ def _push_approval_listener(cfg, row_id, topic, workspace_dir, branch, since):
             if not text:
                 continue
             if _parse_approval(text):
-                r = subprocess.run(["git", "push", "-u", "origin", branch], cwd=workspace_dir,
-                                   capture_output=True, text=True, timeout=120)
+                r = repos.push_branch(cfg, workspace_dir, branch)
                 if r.returncode == 0:
                     log.info("#%s pushed branch %s (approved via ntfy)", row_id, branch)
                     msg_out = f"Pushed `{branch}` to origin."
